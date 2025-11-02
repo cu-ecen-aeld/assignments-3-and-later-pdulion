@@ -5,6 +5,9 @@
 #include <syslog.h>
 #include <unistd.h>
 #include <wait.h>
+#include <string.h>
+
+size_t join_str(char *dest, size_t size, char ** strv, const char *delim);
 
 /**
  * @param cmd the command to execute with system()
@@ -37,6 +40,7 @@ bool do_exec(int count, ...)
 {
     bool result = false;
     openlog("systemcalls", 0, LOG_USER);
+    syslog(LOG_INFO, "========== %s ==========", __func__);
 
     va_list args;
     va_start(args, count);
@@ -47,10 +51,15 @@ bool do_exec(int count, ...)
     }
     command[count] = NULL;
 
+    char buffer [256];
+    join_str(buffer, sizeof(buffer), command, " ");
+    syslog(LOG_INFO, "Command: %s", buffer);
+
     pid_t pid = fork();
     if (pid > 0)
     {
-        // Parent process
+        syslog(LOG_INFO, "Created child process with PID %d", pid);
+
         int status;
         pid_t term_pid = wait(&status);
         if (term_pid < 0)
@@ -64,7 +73,8 @@ bool do_exec(int count, ...)
     }
     else if (pid == 0)
     {
-        // Child process
+        syslog(LOG_INFO, "In child process with PID %d", getpid());
+
         execv(command[0], command);
         syslog(LOG_ERR, "Failed to execute child command: %m");
         _exit(1);
@@ -74,6 +84,8 @@ bool do_exec(int count, ...)
         // Fork failed
         syslog(LOG_ERR, "Failed to fork process: %m");
     }
+
+    syslog(LOG_INFO, "Done %s, with result: %d", __func__, result);
 
     va_end(args);
     closelog();
@@ -89,6 +101,7 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
 {
     bool result = false;
     openlog("systemcalls", 0, LOG_USER);
+    syslog(LOG_INFO, "========== %s ==========", __func__);
 
     va_list args;
     va_start(args, count);
@@ -99,6 +112,11 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
+
+    char buffer [256];
+    join_str(buffer, sizeof(buffer), command, " ");
+    syslog(LOG_INFO, "Command: %s", buffer);
+    syslog(LOG_INFO, "Output file: %s", outputfile);
 
     // Open file to be used by child process for stdout
     int fd = creat(outputfile, 0644);
@@ -111,7 +129,8 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
         pid_t pid = fork();
         if (pid > 0)
         {
-            // Parent process
+            syslog(LOG_INFO, "Created child process with PID %d", pid);
+
             int status;
             pid_t term_pid = wait(&status);
             if (term_pid < 0)
@@ -125,7 +144,8 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
         }
         else if (pid == 0)
         {
-            // Child process
+            syslog(LOG_INFO, "In child process with PID %d", getpid());
+
             if (dup2(fd, STDOUT_FILENO) < 0)
             {
                 syslog(LOG_ERR, "Could not redirect standard output: %m");
@@ -143,7 +163,40 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     }
     close(fd);
 
+    syslog(LOG_INFO, "Done %s, with result: %d", __func__, result);
+
     va_end(args);
     closelog();
     return result;
+}
+
+size_t join_str(char *dest, size_t size, char ** strv, const char *delim)
+{
+    size_t max_len = size - 1;
+    size_t join_len = 0;
+    size_t delim_len = strlen(delim);
+    bool first = true;
+
+    dest[0] = '\0';
+    for (size_t i = 0; strv[i] != NULL; i++)
+    {
+        size_t str_len = strlen(strv[i]);
+        if (!first)
+        {
+            if (join_len + delim_len < max_len)
+            {
+                strcpy(&dest[join_len], delim);
+            }
+            join_len += delim_len;
+        }
+
+        if (join_len + str_len < max_len)
+        {
+            strcpy(&dest[join_len], strv[i]);
+        }
+        join_len += str_len;
+        first = false;
+    }
+
+    return join_len;
 }
