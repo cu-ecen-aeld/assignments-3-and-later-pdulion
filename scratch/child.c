@@ -12,5 +12,6 @@ int main(int argc, char *argv[]) {
         printf("Child created new session: %d\n", getsid(getpid()));
     }
     printf("Child application with PID: %d, and owner: %d\n", getpid(), geteuid());
+
     return 0;
 }
