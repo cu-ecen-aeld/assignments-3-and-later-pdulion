@@ -46,6 +46,7 @@ if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
 fi
 
 echo "Adding the Image in outdir"
+cp ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ${OUTDIR}
 
 echo "Creating the staging directory for the root filesystem"
 cd "$OUTDIR"
@@ -76,6 +77,9 @@ else
 fi
 
 # PD: Make and install busybox
+sed -i '/CONFIG_BASH_IS_HUSH/c\CONFIG_BASH_IS_HUSH=y' .config
+sed -i '/CONFIG_BASH_IS_NONE/c\# CONFIG_BASH_IS_NONE is not set' .config
+
 make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE}
 make CONFIG_PREFIX=${OUTDIR}/rootfs ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} install
 
@@ -104,11 +108,11 @@ make CROSS_COMPILE=${CROSS_COMPILE}
 # PD: Copy the finder related scripts and executables to the /home directory
 # on the target rootfs
 cd "$OUTDIR/rootfs"
-cp -a "$FINDER_APP_DIR"/writer          ./home/
-cp -a "$FINDER_APP_DIR"/finder.sh       ./home/
-cp -a "$FINDER_APP_DIR"/finder-test.sh  ./home/
-cp -a "$FINDER_APP_DIR"/conf            ./home/
-cp -a "$FINDER_APP_DIR"/autorun-qemu.sh ./home/
+cp -a $FINDER_APP_DIR/writer          ./home/
+cp -a $FINDER_APP_DIR/finder.sh       ./home/
+cp -a $FINDER_APP_DIR/finder-test.sh  ./home/
+cp -a $FINDER_APP_DIR/autorun-qemu.sh ./home/
+cp -a $FINDER_APP_DIR/../conf         ./home/
 
 # PD: Chown the root directory
 cd "$OUTDIR/rootfs"
