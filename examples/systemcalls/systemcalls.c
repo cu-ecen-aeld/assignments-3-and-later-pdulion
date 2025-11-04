@@ -18,8 +18,8 @@ size_t join_str(char *dest, size_t size, char ** strv, const char *delim);
  */
 bool do_system(const char *cmd)
 {
-    int rc = system(cmd);
-    return rc == 0;
+    int status = system(cmd);
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
 /**
