@@ -92,8 +92,9 @@ cp $(find $TOOLCHAIN -name libresolv.so.2       ) ./lib64/
 cp $(find $TOOLCHAIN -name libc.so.6            ) ./lib64/
 
 # PD: Make device nodes
-mknod -m 666 dev/null c 1 3
-mknod -m 666 dev/console c 5 1
+cd "$OUTDIR/rootfs"
+sudo mknod -m 666 dev/null c 1 3
+sudo mknod -m 666 dev/console c 5 1
 
 # PD: Clean and build the writer utility
 cd "$FINDER_APP_DIR"
