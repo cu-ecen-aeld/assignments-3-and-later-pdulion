@@ -80,32 +80,39 @@ make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE}
 make CONFIG_PREFIX=${OUTDIR}/rootfs ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} install
 
 echo "Library dependencies"
+cd "$OUTDIR/rootfs"
 ${CROSS_COMPILE}readelf -a bin/busybox | grep "program interpreter"
 ${CROSS_COMPILE}readelf -a bin/busybox | grep "Shared library"
 
-# TODO: Add library dependencies to rootfs
+# PD: Add library dependencies to rootfs
+TOOLCHAIN=$(dirname $(dirname $(which ${CROSS_COMPILE}readelf)))
+cp $(find $TOOLCHAIN -name ld-linux-aarch64.so.1) ./lib/
+cp $(find $TOOLCHAIN -name libm.so.6            ) ./lib64/
+cp $(find $TOOLCHAIN -name libresolv.so.2       ) ./lib64/
+cp $(find $TOOLCHAIN -name libc.so.6            ) ./lib64/
 
 # PD: Make device nodes
-# mknod -m 666 dev/null c 1 3
-# mknod -m 666 dev/console c 5 1
+mknod -m 666 dev/null c 1 3
+mknod -m 666 dev/console c 5 1
 
 # PD: Clean and build the writer utility
-# cd "$FINDER_APP_DIR"
-# make clean
-# make CROSS_COMPILE=${CROSS_COMPILE}
+cd "$FINDER_APP_DIR"
+make clean
+make CROSS_COMPILE=${CROSS_COMPILE}
 
 # PD: Copy the finder related scripts and executables to the /home directory
 # on the target rootfs
-# cp -a "$FINDER_APP_DIR"/writer "$OUTDIR"/rootfs/home
-# cp -a "$FINDER_APP_DIR"/finder.sh "$OUTDIR"/rootfs/home
-# cp -a "$FINDER_APP_DIR"/finder-test.sh "$OUTDIR"/rootfs/home
-# cp -a "$FINDER_APP_DIR"/conf "$OUTDIR"/rootfs/home
-# cp -a "$FINDER_APP_DIR"/autorun-qemu.sh "$OUTDIR"/rootfs/home
+cd "$OUTDIR/rootfs"
+cp -a "$FINDER_APP_DIR"/writer          ./home/
+cp -a "$FINDER_APP_DIR"/finder.sh       ./home/
+cp -a "$FINDER_APP_DIR"/finder-test.sh  ./home/
+cp -a "$FINDER_APP_DIR"/conf            ./home/
+cp -a "$FINDER_APP_DIR"/autorun-qemu.sh ./home/
 
 # PD: Chown the root directory
-# cd "$OUTDIR/rootfs"
-# sudo chown -R root:root *
+cd "$OUTDIR/rootfs"
+sudo chown -R root:root *
 
 # PD: Create initramfs.cpio.gz
-# cd "$OUTDIR/rootfs"
-# find . | cpio -H newc -ov --owner root:root | gzip -9 > ${OUTDIR}/initramfs.cpio.gz
+cd "$OUTDIR/rootfs"
+find . | cpio -H newc -ov --owner root:root | gzip -9 > ${OUTDIR}/initramfs.cpio.gz
