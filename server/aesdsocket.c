@@ -15,17 +15,18 @@
 
 #define BACKLOG 10
 
-void handle_signal(int);
+void handle_signals(int);
+int init_server();
+int init_signals();
+void run_server();
 
-int bind_host();
-
-void run_host(int);
+int listen_fd = -1;
+int connect_fd = -1;
 
 int main(int argc, char *argv[]) {
+    int exit_code = EXIT_FAILURE;
     openlog("aesdsocket", 0, LOG_USER);
     bool daemonize = false;
-    int listen_fd;
-    struct sigaction act;
 
     if (argc == 2 && strcmp(argv[1], "-d") == 0) {
         daemonize = true;
@@ -33,126 +34,143 @@ int main(int argc, char *argv[]) {
 
     if (daemonize) {
         syslog(LOG_ERR, "Daemonize not yet implemented");
-        closelog();
-        return EXIT_FAILURE;
+        goto error_syslog;
     }
 
-    if ((listen_fd = bind_host()) == -1) {
-        syslog(LOG_ERR, "Unable to bind");
-        closelog();
-        return EXIT_FAILURE;
+    if ((listen_fd = init_server()) == -1) {
+        syslog(LOG_ERR, "Unable to bind to host port");
+        goto error_syslog;
     }
 
-    act.sa_handler = handle_signal;
-    sigemptyset(&act.sa_mask);
-    act.sa_flags = SA_RESTART;
-    if (sigaction(SIGINT, &act, NULL) == -1) {
-        syslog(LOG_ERR, "Unable to bind to set action: %m");
-        close(listen_fd);
-        closelog();
-        return EXIT_FAILURE;
+    if (init_signals() == -1) {
+        syslog(LOG_ERR, "Unable to configure signal handling: %m");
+        goto error_server_fd;
     }
 
     if (listen(listen_fd, BACKLOG) == -1) {
         syslog(LOG_ERR, "Unable to listen: %m");
-        close(listen_fd);
-        closelog();
-        return EXIT_FAILURE;
+        goto error_server_fd;
     }
-    run_host(listen_fd);
 
+    run_server();
+    exit_code = EXIT_SUCCESS;
+
+error_server_fd:
+    close(listen_fd);
+
+error_syslog:
     syslog(LOG_INFO, "Exiting");
     closelog();
-    return EXIT_SUCCESS;
+    return exit_code;
 }
 
-int bind_host() {
-    int listen_fd = -1;
-    struct addrinfo hints, *host_info, *info;
+int init_server() {
+    int fd = -1;
     int rc;
+    struct addrinfo hints, *addrs, *entry;
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
 
-    if ((rc = getaddrinfo(NULL, "9000", &hints, &host_info)) != 0) {
+    if ((rc = getaddrinfo(NULL, "9000", &hints, &addrs)) != 0) {
         syslog(LOG_ERR, "Getting address information: %s", gai_strerror(rc));
-        closelog();
-        exit(EXIT_FAILURE);
+        goto error_host_info;
     }
 
-    for (info = host_info; info != NULL; info = info->ai_next) {
+    for (entry = addrs; entry != NULL; entry = entry->ai_next) {
         int yes = 1;
 
-        if ((listen_fd = socket(info->ai_family, info->ai_socktype, info->ai_protocol)) == -1) {
-            syslog(LOG_ERR, "Could not create socket: %m");
+        if ((fd = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol)) == -1) {
+            syslog(LOG_WARNING, "Could not create socket: %m");
             continue;
         }
 
-        if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1) {
-            close(listen_fd);
-            syslog(LOG_ERR, "Could not set socket options: %m");
-            freeaddrinfo(host_info);
-            closelog();
-            exit(EXIT_FAILURE);
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1) {
+            syslog(LOG_ERR, "Failed setting socket options: %m");
+            close(fd);
+            continue;
         }
 
-        if (bind(listen_fd, info->ai_addr, info->ai_addrlen) == -1) {
-            close(listen_fd);
-            syslog(LOG_ERR, "Filed to bind socket: %m");
+        if (bind(fd, entry->ai_addr, entry->ai_addrlen) == -1) {
+            close(fd);
+            syslog(LOG_ERR, "Failed to bind socket: %m");
             continue;
         }
 
         break;
     }
 
-    freeaddrinfo(host_info);
-    return listen_fd;
+error_host_info:
+    freeaddrinfo(addrs);
+    return fd;
 }
 
-void handle_signal(int signo) {
-    (void) signo;
+void handle_signals(int signo) {
+    int saved_errno = errno;
 
-    int saved_errno;
+    if (signo == SIGINT || signo == SIGTERM) {
+        shutdown(connect_fd, SHUT_RDWR);
+        shutdown(listen_fd, SHUT_RDWR);
+    } else if (signo == SIGCHLD) {
+        while (waitpid(-1, NULL, WNOHANG) > 0);
+    }
 
-    saved_errno = errno;
-    syslog(LOG_INFO, "Received signal");
-    while (waitpid(-1, NULL, WNOHANG) > 0);
     errno = saved_errno;
 }
 
-void *get_in_addr(struct sockaddr *sa) {
+int init_signals() {
+    struct sigaction sa;
+
+    sa.sa_handler = handle_signals;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    return sigaction(SIGINT, &sa, NULL);
+}
+
+void *get_addr(struct sockaddr *sa) {
     if (sa->sa_family == AF_INET) {
         return &((struct sockaddr_in *) sa)->sin_addr;
     }
-
     return &((struct sockaddr_in6 *) sa)->sin6_addr;
 }
 
-void run_host(int listen_fd) {
+void run_server() {
     struct sockaddr_storage client_addr;
     socklen_t client_len;
-    int client_fd;
     char client_ip[INET6_ADDRSTRLEN];
 
     syslog(LOG_INFO, "Waiting for connections");
 
     while (true) {
         client_len = sizeof(client_addr);
-        client_fd = accept(listen_fd, (struct sockaddr *) &client_addr, &client_len);
-        if (client_fd == -1) {
-            syslog(LOG_ERR, "Accept failed: %m");
+        connect_fd = accept(listen_fd, (struct sockaddr *) &client_addr, &client_len);
+        if (connect_fd == -1) {
+            if (errno == EINVAL) {
+                syslog(LOG_INFO, "Accept failed, exiting");
+                break;
+            }
+            // Fix invalid argument
             continue;
         }
 
-        inet_ntop(client_addr.ss_family, get_in_addr((struct sockaddr *) &client_addr), client_ip, sizeof client_ip);
-        syslog(LOG_INFO, "Connection from %s", client_ip);
-        if (!fork()) {
-            if (send(client_fd, "Hello, world!", 13, 0) == -1) {
+        inet_ntop(client_addr.ss_family, get_addr((struct sockaddr *) &client_addr), client_ip, sizeof client_ip);
+        syslog(LOG_INFO, "Accepted connection from %s", client_ip);
+        pid_t pid = fork();
+        if (pid == -1) {
+            syslog(LOG_ERR, "Fork failed: %m");
+        } else if (pid > 0) {
+            // Parent
+            close(connect_fd);
+        } else {
+            // Child
+            close(listen_fd);
+            if (send(connect_fd, "Hello, world!", 13, 0) == -1) {
                 syslog(LOG_ERR, "Send failed: %m");
             }
-            close(client_fd);
+            close(connect_fd);
+            exit(0);
         }
     }
 }
