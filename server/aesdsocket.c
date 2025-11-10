@@ -67,7 +67,7 @@ int main(int argc, char *argv[]) {
 }
 
 int bind_host() {
-    int listen_fd;
+    int listen_fd = -1;
     struct addrinfo hints, *host_info, *info;
     int rc;
 
@@ -86,21 +86,21 @@ int bind_host() {
         int yes = 1;
 
         if ((listen_fd = socket(info->ai_family, info->ai_socktype, info->ai_protocol)) == -1) {
-            syslog(LOG_ERR, "Could not open socket: %m");
+            syslog(LOG_ERR, "Could not create socket: %m");
             continue;
         }
 
-        if ((rc = setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes))) == -1) {
+        if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1) {
             close(listen_fd);
-            syslog(LOG_ERR, "Setting socket options: %m");
+            syslog(LOG_ERR, "Could not set socket options: %m");
             freeaddrinfo(host_info);
             closelog();
             exit(EXIT_FAILURE);
         }
 
-        if ((rc = bind(listen_fd, info->ai_addr, info->ai_addrlen)) == -1) {
+        if (bind(listen_fd, info->ai_addr, info->ai_addrlen) == -1) {
             close(listen_fd);
-            syslog(LOG_ERR, "Binding socket: %m");
+            syslog(LOG_ERR, "Filed to bind socket: %m");
             continue;
         }
 
