@@ -28,19 +28,18 @@ int fd_write = -1;
 int init_server() {
     int fd = -1;
     int rc;
-    struct addrinfo hints = {0}, *addrs;
+    struct addrinfo hints = {0}, *info;
 
-    // memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
 
-    if ((rc = getaddrinfo(NULL, "9000", &hints, &addrs)) != 0) {
-        syslog(LOG_ERR, "Getting address information: %s", gai_strerror(rc));
-        goto error_host_info;
+    if ((rc = getaddrinfo(NULL, "9000", &hints, &info)) != 0) {
+        syslog(LOG_ERR, "Error retrieving host address: %s", gai_strerror(rc));
+        goto exit_init;
     }
 
-    for (struct addrinfo *entry = addrs; entry != NULL; entry = entry->ai_next) {
+    for (struct addrinfo *entry = info; entry != NULL; entry = entry->ai_next) {
         int yes = 1;
 
         if ((fd = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol)) == -1) {
@@ -63,8 +62,9 @@ int init_server() {
         break;
     }
 
-error_host_info:
-    freeaddrinfo(addrs);
+    freeaddrinfo(info);
+
+exit_init:
     return fd;
 }
 
@@ -141,77 +141,82 @@ void close_fd(int *fd) {
 }
 
 void handle_client() {
-    size_t bytes_in, bytes_out, offset = 0, capacity = INET_BLOCK_SIZE;
-    int buf_blocks = 0;
-    int fd_read;
+    size_t bytes_in, bytes_out;
 
-    char *buf = malloc(++buf_blocks * INET_BLOCK_SIZE + 1);
+    char *buf = malloc(INET_BLOCK_SIZE + 1);
     if (buf == NULL) {
-        goto error_init;
+        goto exit_start;
     }
 
-    while ((bytes_in = recv(fd_client, buf + offset, capacity, 0)) != 0) {
+    int block_count = 0;
+    size_t received = 0;
+    size_t capacity = INET_BLOCK_SIZE;
+    buf[0] = '\0';
+    while ((bytes_in = recv(fd_client, buf + received, capacity, 0)) != 0) {
         if (bytes_in == -1) {
-            syslog(LOG_ERR, "Failed to receive data: %s", strerror(errno));
-            goto error_receiving;
+            syslog(LOG_ERR, "Error while receiving data: %s", strerror(errno));
+            goto exit_receiving;
         }
 
-        buf[offset + bytes_in] = '\0';
-        if (strchr(buf + offset, '\n')) {
+        buf[received + bytes_in] = '\0';
+        if (strchr(buf + received, '\n')) {
             break;
         }
+        received += bytes_in;
 
-        offset += bytes_in;
         if (bytes_in < capacity) {
             capacity -= bytes_in;
             continue;
         }
 
         char *tmp;
-        if ((tmp = realloc(buf, ++buf_blocks * INET_BLOCK_SIZE + 1)) == NULL) {
+        if ((tmp = realloc(buf, ++block_count * INET_BLOCK_SIZE + 1)) == NULL) {
             syslog(LOG_ERR, "Failed buffer expansion: %s", strerror(errno));
-            goto error_receiving;
+            goto exit_receiving;
         }
         buf = tmp;
         capacity = INET_BLOCK_SIZE;
     }
 
     if (write(fd_write, buf, strlen(buf)) == -1) {
-        syslog(LOG_ERR, "Unable to write to data file: %s", strerror(errno));
-        goto error_receiving;
+        syslog(LOG_ERR, "Error while writing to temp file: %s", strerror(errno));
+        goto exit_receiving;
     }
-    fsync(fd_write);
 
-    fd_read = open(DATA_FILE, O_RDONLY);
-    capacity = buf_blocks * INET_BLOCK_SIZE;
+    int fd_read = open(DATA_FILE, O_RDONLY);
+    capacity = block_count * INET_BLOCK_SIZE;
     while ((bytes_in = read(fd_read, buf, capacity)) != 0) {
         if (bytes_in == -1) {
             if (errno == EINTR) continue;;
             syslog(LOG_ERR, "Unable to read from data file: %s", strerror(errno));
-            goto error_sending;
+            goto exit_sending;
         }
-        offset = 0;
-        while ((bytes_out = send(fd_client, buf + offset, bytes_in - offset, 0)) < bytes_in) {
+        int sent = 0;
+        while (sent < bytes_in) {
+            bytes_out = send(fd_client, buf + sent, bytes_in - sent, 0);
             if (bytes_out == -1) {
                 syslog(LOG_ERR, "Unable to send from data file: %s", strerror(errno));
-                goto error_sending;
+                goto exit_sending;
             }
-            offset += bytes_out;
+            if (bytes_out == 0) {
+                syslog(LOG_WARNING, "Client disconnected");
+                break;
+            }
+            sent += bytes_out;
         }
     }
 
     exit_code = EXIT_SUCCESS;
 
-error_sending:
+exit_sending:
     close(fd_read);
 
-error_receiving:
+exit_receiving:
     free(buf);
 
-error_init:
+exit_start:
     close_fd(&fd_client);
     close_fd(&fd_write);
-
     exit(exit_code);
 }
 
@@ -236,6 +241,7 @@ void run_server() {
         pid_t pid = fork();
         if (pid == -1) {
             syslog(LOG_ERR, "Fork failed: %s", strerror(errno));
+            close_fd(&fd_client);
             return;
         }
 
