@@ -21,8 +21,79 @@
 const char *DATA_FILE = "/var/tmp/aesdsocketdata";
 const int INET_BLOCK_SIZE = 1024;
 
-bool is_shutdown = false;
+volatile bool is_shutdown = false;
 int listener_fd = -1;
+
+int daemonize() {
+    pid_t pid = fork();
+    if (pid == -1) {
+        syslog(LOG_ERR, "Fork failed: %s", strerror(errno));
+        return -1;
+    }
+    if (pid > 0) {
+        // Parent: Daemon successfully created
+        closelog();
+        exit(EXIT_SUCCESS);
+    }
+
+    // Child: Configure for Daemon mode!
+    if (setsid() == -1) {
+        syslog(LOG_ERR, "Failed to create new session and process group: %s", strerror(errno));
+        return -1;
+    }
+    if (chdir("/") == -1) {
+        syslog(LOG_ERR, "Failed changing to root directory: %s", strerror(errno));
+        return -1;
+    }
+
+    struct rlimit rl;
+    getrlimit(RLIMIT_NOFILE, &rl);
+    for (int i = 0; i < rl.rlim_max; i++) close(i);
+
+    open("/dev/null", O_RDWR);
+    dup(STDIN_FILENO);
+    dup(STDIN_FILENO);
+
+    return 0;
+}
+
+void shutdown_handler(int signum) {
+    const int old_errno = errno;
+
+    if (signum == SIGINT || signum == SIGTERM) {
+        is_shutdown = true;
+        if (listener_fd >= 0) shutdown(listener_fd, SHUT_RDWR);
+    }
+
+    errno = old_errno;
+}
+
+void child_exit_handler(int signum) {
+    const int old_errno = errno;
+
+    if (signum == SIGCHLD) {
+        while (waitpid(-1, NULL, WNOHANG) > 0);
+    }
+
+    errno = old_errno;
+}
+
+int init_signals() {
+    struct sigaction sa;
+
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sa.sa_handler = shutdown_handler;
+    if (sigaction(SIGINT, &sa, NULL) == -1) return -1;
+    if (sigaction(SIGTERM, &sa, NULL) == -1) return -1;
+
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sa.sa_handler = child_exit_handler;
+    if (sigaction(SIGCHLD, &sa, NULL) == -1) return -1;
+
+    return 0;
+}
 
 int open_listener() {
     int fd = -1;
@@ -62,42 +133,11 @@ int open_listener() {
 
     freeaddrinfo(info);
 
-exit_start:
-    return fd;
+    exit_start:
+        return fd;
 }
 
-void shutdown_handler(int signum) {
-    const int old_errno = errno;
-
-    if (signum == SIGCHLD) {
-        while (waitpid(-1, NULL, WNOHANG) > 0);
-    } else if (signum == SIGINT || signum == SIGTERM) {
-        is_shutdown = true;
-        if (listener_fd >= 0) shutdown(listener_fd, SHUT_RDWR);
-    }
-
-    errno = old_errno;
-}
-
-void child_exit_handler(int signum) {
-
-}
-
-int init_signals() {
-    struct sigaction sa;
-
-    sa.sa_handler = shutdown_handler;
-    sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGINT, &sa, NULL) == -1) return -1;
-    if (sigaction(SIGTERM, &sa, NULL) == -1) return -1;
-
-    sa.sa_handler = child_exit_handler;
-    sa.sa_flags = SA_RESTART;
-    if (sigaction(SIGCHLD, &sa, NULL) == -1) return -1;
-    return 0;
-}
-
-void close_listener_fd() {
+void close_listener() {
     sigset_t new_mask;
     sigset_t old_mask;
 
@@ -120,14 +160,19 @@ void close_listener_fd() {
 
 void await_child_processes() {
     sigset_t new_mask;
+    sigset_t old_mask;
 
     sigemptyset(&new_mask);
     sigaddset(&new_mask, SIGCHLD);
-    if (sigprocmask(SIG_BLOCK, &new_mask, NULL) == -1) {
+    if (sigprocmask(SIG_BLOCK, &new_mask, &old_mask) == -1) {
         syslog(LOG_ERR, "Signal block failed: %s", strerror(errno));
     }
 
     while (waitpid(-1, NULL, 0) > 0) {
+    }
+
+    if (sigprocmask(SIG_SETMASK, &old_mask, NULL) == -1) {
+        syslog(LOG_ERR, "Signal restoration failed: %s", strerror(errno));
     }
 }
 
@@ -280,43 +325,10 @@ void run_server() {
                 addr = &((struct sockaddr_in6 *) &client_addr)->sin6_addr;
             }
             inet_ntop(client_addr.ss_family, addr, client_host, sizeof(client_host));
-            close_listener_fd();
+            close_listener();
             connection_handler(client_fd, client_host);
         }
     }
-}
-
-int daemonize() {
-    pid_t pid = fork();
-    if (pid == -1) {
-        syslog(LOG_ERR, "Fork failed: %s", strerror(errno));
-        return -1;
-    }
-    if (pid > 0) {
-        // Parent: Daemon successfully created
-        closelog();
-        exit(EXIT_SUCCESS);
-    }
-
-    // Child: Configure for Daemon mode!
-    if (setsid() == -1) {
-        syslog(LOG_ERR, "Failed to create new session and process group: %s", strerror(errno));
-        return -1;
-    }
-    if (chdir("/") == -1) {
-        syslog(LOG_ERR, "Failed changing to root directory: %s", strerror(errno));
-        return -1;
-    }
-
-    struct rlimit rl;
-    getrlimit(RLIMIT_NOFILE, &rl);
-    for (int i = 0; i < rl.rlim_max; i++) close(i);
-
-    open("/dev/null", O_RDWR);
-    dup(STDIN_FILENO);
-    dup(STDIN_FILENO);
-
-    return 0;
 }
 
 int main(int argc, char *argv[]) {
@@ -357,7 +369,7 @@ int main(int argc, char *argv[]) {
     }
 
 exit_server_init:
-    close_listener_fd();
+    close_listener();
 
 exit_start:
     closelog();
