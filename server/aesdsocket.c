@@ -69,7 +69,7 @@ exit_init:
 }
 
 void handle_signals(int signum) {
-    int old_errno = errno;
+    const int old_errno = errno;
 
     if (signum == SIGCHLD) {
         while (waitpid(-1, NULL, WNOHANG) > 0);
@@ -191,7 +191,8 @@ void handle_client() {
             syslog(LOG_ERR, "Unable to read from data file: %s", strerror(errno));
             goto exit_sending;
         }
-        int sent = 0;
+
+        size_t sent = 0;
         while (sent < bytes_in) {
             bytes_out = send(fd_client, buf + sent, bytes_in - sent, 0);
             if (bytes_out == -1) {
