@@ -226,7 +226,7 @@ exit_start:
     exit(exit_code);
 }
 
-int run_server() {
+void run_server() {
     struct sockaddr_storage client_addr;
     socklen_t client_len;
 
@@ -239,17 +239,17 @@ int run_server() {
                 continue;
             }
             if (is_shutdown) {
-                return EXIT_SUCCESS;
+                return;
             }
             syslog(LOG_INFO, "Accept failed: %s", strerror(errno));
-            return EXIT_FAILURE;
+            return;
         }
 
         pid_t pid = fork();
         if (pid == -1) {
             syslog(LOG_ERR, "Fork failed: %s", strerror(errno));
             close(client_fd);
-            return EXIT_FAILURE;
+            return;
         }
 
         if (pid > 0) {
@@ -317,7 +317,12 @@ int main(int argc, char *argv[]) {
         goto exit_file_init;
     }
 
-    exit_code = run_server();
+    run_server();
+    if (is_shutdown) {
+        syslog(LOG_INFO, "Caught signal, exiting");
+        exit_code = EXIT_SUCCESS;
+    }
+
     await_child_processes();
 
 exit_file_init:
@@ -329,7 +334,6 @@ exit_server_init:
     close_listener_fd();
 
 exit_start:
-    syslog(LOG_INFO, "Exiting");
     closelog();
 
     // Set to EXIT_SUCCESS by SIGTERM and SIGINT in handle_signals()
