@@ -9,31 +9,32 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <syslog.h>
 #include <unistd.h>
-#include <sys/resource.h>
 
 #define ACCEPT_BACKLOG 10
 
 const char *DATA_FILE = "/var/tmp/aesdsocketdata";
 const int INET_BLOCK_SIZE = 1024;
 
-volatile bool is_shutdown = false;
+volatile sig_atomic_t g_shutdown = false;
 int listener_fd = -1;
 
 int daemonize() {
     pid_t pid = fork();
     if (pid == -1) {
-        syslog(LOG_ERR, "Fork failed: %s", strerror(errno));
+        syslog(LOG_ERR, "Failed to create daemon process: %s", strerror(errno));
         return -1;
     }
     if (pid > 0) {
         // Parent: Daemon successfully created
         closelog();
-        exit(EXIT_SUCCESS);
+        _exit(EXIT_SUCCESS);
     }
 
     // Child: Configure for Daemon mode!
@@ -41,18 +42,29 @@ int daemonize() {
         syslog(LOG_ERR, "Failed to create new session and process group: %s", strerror(errno));
         return -1;
     }
+
+    umask(0);
     if (chdir("/") == -1) {
         syslog(LOG_ERR, "Failed changing to root directory: %s", strerror(errno));
         return -1;
     }
 
     struct rlimit rl;
-    getrlimit(RLIMIT_NOFILE, &rl);
-    for (int i = 0; i < rl.rlim_max; i++) close(i);
+    if (getrlimit(RLIMIT_NOFILE, &rl) == -1) {
+        syslog(LOG_ERR, "Failed limit for open files: %s", strerror(errno));
+        return -1;
+    }
+    for (int i = 0; i < (int) rl.rlim_max; i++) close(i);
 
-    open("/dev/null", O_RDWR);
-    dup(STDIN_FILENO);
-    dup(STDIN_FILENO);
+    const int fd = open("/dev/null", O_RDWR);
+    if (fd == -1) {
+        syslog(LOG_ERR, "Failed limit for open files: %s", strerror(errno));
+        return -1;
+    }
+    dup2(fd, STDIN_FILENO);
+    dup2(fd, STDIN_FILENO);
+    dup2(fd, STDERR_FILENO);
+    if (fd > STDERR_FILENO) close(fd);
 
     return 0;
 }
@@ -61,7 +73,7 @@ void shutdown_handler(int signum) {
     const int old_errno = errno;
 
     if (signum == SIGINT || signum == SIGTERM) {
-        is_shutdown = true;
+        g_shutdown = true;
         if (listener_fd >= 0) shutdown(listener_fd, SHUT_RDWR);
     }
 
@@ -92,6 +104,11 @@ int init_signals() {
     sa.sa_handler = child_exit_handler;
     if (sigaction(SIGCHLD, &sa, NULL) == -1) return -1;
 
+    // Ignore SIGPIPE whenever child breaks its connection
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sa.sa_handler = SIG_IGN;
+    if (sigaction(SIGPIPE, &sa, NULL) == -1) return -1;
     return 0;
 }
 
@@ -133,8 +150,8 @@ int open_listener() {
 
     freeaddrinfo(info);
 
-    exit_start:
-        return fd;
+exit_start:
+    return fd;
 }
 
 void close_listener() {
@@ -176,22 +193,22 @@ void await_child_processes() {
     }
 }
 
-void connection_handler(int fd_client, char *client_host) {
+void connection_handler(const int fd_client, const char *client_host) {
     int exit_code = EXIT_FAILURE;
     syslog(LOG_INFO, "Accepted connection from %s", client_host);
 
-    ssize_t capacity = INET_BLOCK_SIZE;
+    size_t capacity = INET_BLOCK_SIZE;
     char *buf = malloc(capacity);
     if (!buf) {
         syslog(LOG_ERR, "Failed buffer allocation: %s", strerror(errno));
         goto exit_start;
     }
 
-    ssize_t pkt_len = 0, recv_len;
+    size_t pkt_len = 0;
     for (;;) {
-        recv_len = recv(fd_client, buf + pkt_len, capacity - pkt_len, 0);
+        ssize_t recv_len = recv(fd_client, buf + pkt_len, capacity - pkt_len, 0);
         if (recv_len == -1) {
-            if (errno == EINTR) continue;;
+            if (errno == EINTR) continue;
             syslog(LOG_ERR, "Error while receiving data: %s", strerror(errno));
             goto exit_buffer;
         }
@@ -257,7 +274,7 @@ void connection_handler(int fd_client, char *client_host) {
         while (sent < read_len) {
             const ssize_t send_len = send(fd_client, buf + sent, read_len - sent, 0);
             if (send_len == -1) {
-                if (errno == EINTR) continue;;
+                if (errno == EINTR) continue;
                 syslog(LOG_ERR, "Unable to send from data file: %s", strerror(errno));
                 goto exit_lock;
             }
@@ -298,7 +315,7 @@ void run_server() {
             if (errno == EINTR) {
                 continue;
             }
-            if (is_shutdown) {
+            if (g_shutdown) {
                 return;
             }
             syslog(LOG_INFO, "Accept failed: %s", strerror(errno));
@@ -317,16 +334,21 @@ void run_server() {
             close(client_fd);
         } else {
             // Detach child's reference to listen_fd
-            char client_host[INET6_ADDRSTRLEN];
             void *addr;
             if (client_addr.ss_family == AF_INET) {
                 addr = &((struct sockaddr_in *) &client_addr)->sin_addr;
             } else {
                 addr = &((struct sockaddr_in6 *) &client_addr)->sin6_addr;
             }
-            inet_ntop(client_addr.ss_family, addr, client_host, sizeof(client_host));
+
+            char client_ip[INET6_ADDRSTRLEN];
+            if (!inet_ntop(client_addr.ss_family, addr, client_ip, sizeof(client_ip))) {
+                memset(client_ip, 0, sizeof(client_ip));
+                strncpy(client_ip, "unknown", sizeof(client_ip));
+            }
+
             close_listener();
-            connection_handler(client_fd, client_host);
+            connection_handler(client_fd, client_ip);
         }
     }
 }
@@ -358,7 +380,7 @@ int main(int argc, char *argv[]) {
     }
 
     run_server();
-    if (is_shutdown) {
+    if (g_shutdown) {
         syslog(LOG_INFO, "Caught signal, exiting");
         exit_code = EXIT_SUCCESS;
     }
