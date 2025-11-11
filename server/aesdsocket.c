@@ -62,7 +62,7 @@ int daemonize() {
         return -1;
     }
     dup2(fd, STDIN_FILENO);
-    dup2(fd, STDIN_FILENO);
+    dup2(fd, STDOUT_FILENO);
     dup2(fd, STDERR_FILENO);
     if (fd > STDERR_FILENO) close(fd);
 
@@ -249,9 +249,13 @@ void connection_handler(const int fd_client, const char *client_host) {
         goto exit_file;
     }
 
-    if (write(fd_data, buf, pkt_len) == -1) {
-        syslog(LOG_ERR, "Unable to write to temp file: %d - %s", errno, strerror(errno));
-        goto exit_lock;
+    for (size_t written = 0; written < pkt_len;) {
+        const ssize_t write_len = write(fd_data, buf, pkt_len);
+        if (write_len == -1) {
+            syslog(LOG_ERR, "Unable to write to temp file: %d - %s", errno, strerror(errno));
+            goto exit_lock;
+        }
+        written += write_len;
     }
 
     if (lseek(fd_data, 0, SEEK_SET) == -1) {
@@ -260,7 +264,7 @@ void connection_handler(const int fd_client, const char *client_host) {
     }
 
     for (;;) {
-        ssize_t read_len = read(fd_data, buf, capacity);
+        const ssize_t read_len = read(fd_data, buf, capacity);
         if (read_len == -1) {
             if (errno == EINTR) continue;
             syslog(LOG_ERR, "Unable to read from data file: %s", strerror(errno));
@@ -270,17 +274,12 @@ void connection_handler(const int fd_client, const char *client_host) {
             break;
         }
 
-        ssize_t sent = 0;
-        while (sent < read_len) {
+        for (ssize_t sent = 0; sent < read_len;) {
             const ssize_t send_len = send(fd_client, buf + sent, read_len - sent, 0);
             if (send_len == -1) {
                 if (errno == EINTR) continue;
                 syslog(LOG_ERR, "Unable to send from data file: %s", strerror(errno));
                 goto exit_lock;
-            }
-            if (send_len == 0) {
-                syslog(LOG_WARNING, "Client disconnected");
-                break;
             }
             sent += send_len;
         }
