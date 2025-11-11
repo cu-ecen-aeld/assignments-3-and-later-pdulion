@@ -36,7 +36,7 @@ int init_server() {
 
     if ((rc = getaddrinfo(NULL, "9000", &hints, &info)) != 0) {
         syslog(LOG_ERR, "Error retrieving host address: %s", gai_strerror(rc));
-        goto exit_init;
+        goto exit_start;
     }
 
     for (struct addrinfo *entry = info; entry != NULL; entry = entry->ai_next) {
@@ -64,7 +64,7 @@ int init_server() {
 
     freeaddrinfo(info);
 
-exit_init:
+exit_start:
     return fd;
 }
 
