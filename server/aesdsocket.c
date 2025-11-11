@@ -2,7 +2,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <features.h>
-#include <linux/limits.h>
 #include <netdb.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -15,6 +14,7 @@
 #include <sys/wait.h>
 #include <syslog.h>
 #include <unistd.h>
+#include <sys/resource.h>
 
 #define ACCEPT_BACKLOG 10
 
@@ -24,7 +24,7 @@ const int INET_BLOCK_SIZE = 1024;
 bool is_shutdown = false;
 int listener_fd = -1;
 
-int init_server() {
+int open_listener() {
     int fd = -1;
     int rc;
     struct addrinfo hints = {0}, *info;
@@ -66,7 +66,7 @@ exit_start:
     return fd;
 }
 
-void signal_handler(int signum) {
+void shutdown_handler(int signum) {
     const int old_errno = errno;
 
     if (signum == SIGCHLD) {
@@ -79,14 +79,20 @@ void signal_handler(int signum) {
     errno = old_errno;
 }
 
+void child_exit_handler(int signum) {
+
+}
+
 int init_signals() {
     struct sigaction sa;
 
-    sa.sa_handler = signal_handler;
+    sa.sa_handler = shutdown_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
     if (sigaction(SIGINT, &sa, NULL) == -1) return -1;
     if (sigaction(SIGTERM, &sa, NULL) == -1) return -1;
+
+    sa.sa_handler = child_exit_handler;
+    sa.sa_flags = SA_RESTART;
     if (sigaction(SIGCHLD, &sa, NULL) == -1) return -1;
     return 0;
 }
@@ -280,50 +286,63 @@ void run_server() {
     }
 }
 
+int daemonize() {
+    pid_t pid = fork();
+    if (pid == -1) {
+        syslog(LOG_ERR, "Fork failed: %s", strerror(errno));
+        return -1;
+    }
+    if (pid > 0) {
+        // Parent: Daemon successfully created
+        closelog();
+        exit(EXIT_SUCCESS);
+    }
+
+    // Child: Configure for Daemon mode!
+    if (setsid() == -1) {
+        syslog(LOG_ERR, "Failed to create new session and process group: %s", strerror(errno));
+        return -1;
+    }
+    if (chdir("/") == -1) {
+        syslog(LOG_ERR, "Failed changing to root directory: %s", strerror(errno));
+        return -1;
+    }
+
+    struct rlimit rl;
+    getrlimit(RLIMIT_NOFILE, &rl);
+    for (int i = 0; i < rl.rlim_max; i++) close(i);
+
+    open("/dev/null", O_RDWR);
+    dup(STDIN_FILENO);
+    dup(STDIN_FILENO);
+
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     int exit_code = EXIT_FAILURE;
     openlog("aesdsocket", 0, LOG_USER);
 
     if (argc == 2 && strcmp(argv[1], "-d") == 0) {
-        pid_t pid = fork();
-        if (pid == -1) {
-            syslog(LOG_ERR, "Fork failed: %s", strerror(errno));
+        if (daemonize() == -1) {
             goto exit_start;
         }
-        if (pid > 0) {
-            // Parent: Daemon successfully created
-            exit_code = EXIT_SUCCESS;
-            goto exit_start;
-        }
-        // Child: Configure for Daemon mode!
-        if (setsid() == -1) {
-            syslog(LOG_ERR, "Failed to create new session and process group: %s", strerror(errno));
-            goto exit_start;
-        }
-        if (chdir("/") == -1) {
-            syslog(LOG_ERR, "Failed to change directory to /");
-            goto exit_start;
-        }
-        for (int i = 0; i < NR_OPEN; i++) close(i);
-        open("/dev/null", O_RDWR);
-        dup(STDIN_FILENO);
-        dup(STDIN_FILENO);
-    }
-
-    listener_fd = init_server();
-    if (listener_fd == -1) {
-        syslog(LOG_ERR, "Unable to bind to host port");
-        goto exit_server_init;
     }
 
     if (init_signals() == -1) {
         syslog(LOG_ERR, "Unable to configure signal handling: %s", strerror(errno));
-        goto exit_server_init;
+        goto exit_start;
+    }
+
+    listener_fd = open_listener();
+    if (listener_fd == -1) {
+        syslog(LOG_ERR, "Unable to bind to host port");
+        goto exit_start;
     }
 
     if (listen(listener_fd, ACCEPT_BACKLOG) == -1) {
         syslog(LOG_ERR, "Unable to listen for connections: %s", strerror(errno));
-        goto exit_file_init;
+        goto exit_server_init;
     }
 
     run_server();
@@ -333,10 +352,8 @@ int main(int argc, char *argv[]) {
     }
 
     await_child_processes();
-
-exit_file_init:
-    if (remove(DATA_FILE) == -1) {
-        syslog(LOG_ERR, "Unable to remove data file: %s", strerror(errno));
+    if (remove(DATA_FILE) == -1 && errno != ENOENT) {
+        syslog(LOG_ERR, "Unable to remove %s: %s", DATA_FILE, strerror(errno));
     }
 
 exit_server_init:
