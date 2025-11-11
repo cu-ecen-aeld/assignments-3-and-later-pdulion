@@ -13,6 +13,7 @@
 #include <sys/wait.h>
 #include <syslog.h>
 #include <unistd.h>
+#include <linux/limits.h>
 
 #define ACCEPT_BACKLOG 10
 
@@ -251,50 +252,64 @@ void run_server() {
 
 int main(int argc, char *argv[]) {
     openlog("aesdsocket", 0, LOG_USER);
-    bool daemonize = false;
 
     if (argc == 2 && strcmp(argv[1], "-d") == 0) {
-        daemonize = true;
-    }
-
-    if (daemonize) {
-        syslog(LOG_ERR, "Daemonize not yet implemented");
-        goto error_syslog;
+        pid_t pid = fork();
+        if (pid == -1) {
+            syslog(LOG_ERR, "Fork failed: %s", strerror(errno));
+            goto exit_syslog;
+        }
+        if (pid > 0) {
+            exit_code = EXIT_SUCCESS;
+            goto exit_syslog;
+        }
+        if (setsid() == -1) {
+            syslog(LOG_ERR, "Failed to create new session and process group: %s", strerror(errno));
+            goto exit_syslog;
+        }
+        if (chdir("/") == -1) {
+            syslog(LOG_ERR, "Failed to change directory to /");
+            goto exit_syslog;
+        }
+        for (int i = 0; i < NR_OPEN; i++) close(i);
+        open("/dev/null", O_RDWR);
+        dup(STDIN_FILENO);
+        dup(STDIN_FILENO);
     }
 
     fd_listen = init_server();
     if (fd_listen == -1) {
         syslog(LOG_ERR, "Unable to bind to host port");
-        goto error_data_fd;
+        goto exit_data_fd;
     }
 
     if (init_signals() == -1) {
         syslog(LOG_ERR, "Unable to configure signal handling: %s", strerror(errno));
-        goto error_server_fd;
+        goto exit_server_fd;
     }
 
     if ((fd_write = creat(DATA_FILE, 0644)) == -1) {
         syslog(LOG_ERR, "Unable to create socket data file: %s", strerror(errno));
-        goto error_syslog;
+        goto exit_syslog;
     }
 
     if (listen(fd_listen, ACCEPT_BACKLOG) == -1) {
         syslog(LOG_ERR, "Unable to listen: %s", strerror(errno));
-        goto error_server_fd;
+        goto exit_server_fd;
     }
 
     run_server();
 
-error_data_fd:
+exit_data_fd:
     close_fd(&fd_write);
     if (remove(DATA_FILE) == -1) {
         syslog(LOG_ERR, "Unable to remove data file: %s", strerror(errno));
     }
 
-error_server_fd:
+exit_server_fd:
     close_fd(&fd_listen);
 
-error_syslog:
+exit_syslog:
     syslog(LOG_INFO, "Exiting");
     closelog();
 
