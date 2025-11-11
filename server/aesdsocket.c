@@ -245,14 +245,14 @@ void connection_handler(const int fd_client, const char *client_host) {
     }
 
     if (flock(fd_data, LOCK_EX) == -1) {
-        syslog(LOG_ERR, "Unable to lock temp file: %d - %s", errno, strerror(errno));
+        syslog(LOG_ERR, "Unable to lock data file: %d - %s", errno, strerror(errno));
         goto exit_file;
     }
 
     for (size_t written = 0; written < pkt_len;) {
-        const ssize_t write_len = write(fd_data, buf, pkt_len);
+        const ssize_t write_len = write(fd_data, buf + written, pkt_len - written);
         if (write_len == -1) {
-            syslog(LOG_ERR, "Unable to write to temp file: %d - %s", errno, strerror(errno));
+            syslog(LOG_ERR, "Unable to write to data file: %d - %s", errno, strerror(errno));
             goto exit_lock;
         }
         written += write_len;
@@ -311,11 +311,11 @@ void run_server() {
         client_len = sizeof(client_addr);
         int client_fd = accept(listener_fd, (struct sockaddr *) &client_addr, &client_len);
         if (client_fd == -1) {
-            if (errno == EINTR) {
+            if (errno == EINTR) continue;
+            if (g_shutdown) return;
+            if (errno == ECONNABORTED || errno == EPROTO || errno == ENETDOWN /* etc. */) {
+                syslog(LOG_WARNING, "Accept transient error: %s", strerror(errno));
                 continue;
-            }
-            if (g_shutdown) {
-                return;
             }
             syslog(LOG_INFO, "Accept failed: %s", strerror(errno));
             return;
