@@ -17,11 +17,12 @@
 #define ACCEPT_BACKLOG 10
 
 const char *DATA_FILE = "/var/tmp/aesdsocketdata";
+const int INET_BLOCK_SIZE = 1024;
 
 int exit_code = EXIT_FAILURE;
-int listen_fd = -1;
-int client_fd = -1;
-int data_fd = -1;
+int fd_listen = -1;
+int fd_client = -1;
+int fd_write = -1;
 
 int init_server() {
     int fd = -1;
@@ -72,11 +73,11 @@ void handle_signals(int signum) {
     if (signum == SIGCHLD) {
         while (waitpid(-1, NULL, WNOHANG) > 0);
     } else if (signum == SIGINT || signum == SIGTERM) {
-        if (client_fd != -1) shutdown(client_fd, SHUT_RDWR);
-        if (listen_fd != -1) shutdown(listen_fd, SHUT_RDWR);
-        if (data_fd != -1) {
-            close(data_fd);
-            data_fd = -1;
+        if (fd_client != -1) shutdown(fd_client, SHUT_RDWR);
+        if (fd_listen != -1) shutdown(fd_listen, SHUT_RDWR);
+        if (fd_write != -1) {
+            close(fd_write);
+            fd_write = -1;
         }
 
         exit_code = EXIT_SUCCESS;
@@ -139,14 +140,78 @@ void close_fd(int *fd) {
 }
 
 void handle_client() {
-    if (send(client_fd, "Hello, world!", 13, 0) == -1) {
-        syslog(LOG_ERR, "Send failed: %s", strerror(errno));
+    size_t bytes_in, bytes_out, offset = 0, capacity = INET_BLOCK_SIZE;
+    int buf_blocks = 0;
+    int fd_read;
+
+    char *buf = malloc(++buf_blocks * INET_BLOCK_SIZE + 1);
+    if (buf == NULL) {
+        goto error_init;
     }
 
+    while ((bytes_in = recv(fd_client, buf + offset, capacity, 0)) != 0) {
+        if (bytes_in == -1) {
+            syslog(LOG_ERR, "Failed to receive data: %s", strerror(errno));
+            goto error_receiving;
+        }
 
-    close_fd(&client_fd);
-    close_fd(&data_fd);
-    exit(EXIT_SUCCESS);
+        buf[offset + bytes_in] = '\0';
+        if (strchr(buf + offset, '\n')) {
+            break;
+        }
+
+        offset += bytes_in;
+        if (bytes_in < capacity) {
+            capacity -= bytes_in;
+            continue;
+        }
+
+        char *tmp;
+        if ((tmp = realloc(buf, ++buf_blocks * INET_BLOCK_SIZE + 1)) == NULL) {
+            syslog(LOG_ERR, "Failed buffer expansion: %s", strerror(errno));
+            goto error_receiving;
+        }
+        buf = tmp;
+        capacity = INET_BLOCK_SIZE;
+    }
+
+    if (write(fd_write, buf, strlen(buf)) == -1) {
+        syslog(LOG_ERR, "Unable to write to data file: %s", strerror(errno));
+        goto error_receiving;
+    }
+    fsync(fd_write);
+
+    fd_read = open(DATA_FILE, O_RDONLY);
+    capacity = buf_blocks * INET_BLOCK_SIZE;
+    while ((bytes_in = read(fd_read, buf, capacity)) != 0) {
+        if (bytes_in == -1) {
+            if (errno == EINTR) continue;;
+            syslog(LOG_ERR, "Unable to read from data file: %s", strerror(errno));
+            goto error_sending;
+        }
+        offset = 0;
+        while ((bytes_out = send(fd_client, buf + offset, bytes_in - offset, 0)) < bytes_in) {
+            if (bytes_out == -1) {
+                syslog(LOG_ERR, "Unable to send from data file: %s", strerror(errno));
+                goto error_sending;
+            }
+            offset += bytes_out;
+        }
+    }
+
+    exit_code = EXIT_SUCCESS;
+
+error_sending:
+    close(fd_read);
+
+error_receiving:
+    free(buf);
+
+error_init:
+    close_fd(&fd_client);
+    close_fd(&fd_write);
+
+    exit(exit_code);
 }
 
 void run_server() {
@@ -157,8 +222,8 @@ void run_server() {
 
     while (true) {
         client_len = sizeof(client_addr);
-        client_fd = accept(listen_fd, (struct sockaddr *) &client_addr, &client_len);
-        if (client_fd == -1) {
+        fd_client = accept(fd_listen, (struct sockaddr *) &client_addr, &client_len);
+        if (fd_client == -1) {
             if (errno == EINTR) {
                 continue;
             }
@@ -175,10 +240,10 @@ void run_server() {
 
         if (pid > 0) {
             // Detach parent's reference to client_fd
-            close_fd(&client_fd);
+            close_fd(&fd_client);
         } else {
             // Detach child's reference to listen_fd
-            close_fd(&listen_fd);
+            close_fd(&fd_listen);
             handle_client();
         }
     }
@@ -197,8 +262,8 @@ int main(int argc, char *argv[]) {
         goto error_syslog;
     }
 
-    listen_fd = init_server();
-    if (listen_fd == -1) {
+    fd_listen = init_server();
+    if (fd_listen == -1) {
         syslog(LOG_ERR, "Unable to bind to host port");
         goto error_data_fd;
     }
@@ -208,12 +273,12 @@ int main(int argc, char *argv[]) {
         goto error_server_fd;
     }
 
-    if ((data_fd = creat(DATA_FILE, 0644)) == -1) {
+    if ((fd_write = creat(DATA_FILE, 0644)) == -1) {
         syslog(LOG_ERR, "Unable to create socket data file: %s", strerror(errno));
         goto error_syslog;
     }
 
-    if (listen(listen_fd, ACCEPT_BACKLOG) == -1) {
+    if (listen(fd_listen, ACCEPT_BACKLOG) == -1) {
         syslog(LOG_ERR, "Unable to listen: %s", strerror(errno));
         goto error_server_fd;
     }
@@ -221,13 +286,13 @@ int main(int argc, char *argv[]) {
     run_server();
 
 error_data_fd:
-    close_fd(&data_fd);
+    close_fd(&fd_write);
     if (remove(DATA_FILE) == -1) {
         syslog(LOG_ERR, "Unable to remove data file: %s", strerror(errno));
     }
 
 error_server_fd:
-    close_fd(&listen_fd);
+    close_fd(&fd_listen);
 
 error_syslog:
     syslog(LOG_INFO, "Exiting");
