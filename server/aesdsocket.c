@@ -20,10 +20,8 @@
 const char *DATA_FILE = "/var/tmp/aesdsocketdata";
 const int INET_BLOCK_SIZE = 1024;
 
-int exit_code = EXIT_FAILURE;
-int fd_listen = -1;
-int fd_client = -1;
-int fd_write = -1;
+bool is_shutdown = false;
+int listener_fd = -1;
 
 int init_server() {
     int fd = -1;
@@ -74,14 +72,8 @@ void handle_signals(int signum) {
     if (signum == SIGCHLD) {
         while (waitpid(-1, NULL, WNOHANG) > 0);
     } else if (signum == SIGINT || signum == SIGTERM) {
-        if (fd_client != -1) shutdown(fd_client, SHUT_RDWR);
-        if (fd_listen != -1) shutdown(fd_listen, SHUT_RDWR);
-        if (fd_write != -1) {
-            close(fd_write);
-            fd_write = -1;
-        }
-
-        exit_code = EXIT_SUCCESS;
+        is_shutdown = true;
+        if (listener_fd >= 0) shutdown(listener_fd, SHUT_RDWR);
     }
 
     errno = old_errno;
@@ -106,20 +98,7 @@ void *get_addr(struct sockaddr *sa) {
     return &((struct sockaddr_in6 *) sa)->sin6_addr;
 }
 
-void log_client_ip(struct sockaddr_storage *client_addr) {
-    void *addr;
-    char client_ip[INET6_ADDRSTRLEN];
-
-    if (client_addr->ss_family == AF_INET) {
-        addr = &((struct sockaddr_in *) client_addr)->sin_addr;
-    } else {
-        addr = &((struct sockaddr_in6 *) client_addr)->sin6_addr;
-    }
-    inet_ntop(client_addr->ss_family, addr, client_ip, sizeof client_ip);
-    syslog(LOG_INFO, "Accepted connection from %s", client_ip);
-}
-
-void close_fd(int *fd) {
+void close_listener_fd() {
     sigset_t new_mask;
     sigset_t old_mask;
 
@@ -130,9 +109,9 @@ void close_fd(int *fd) {
         syslog(LOG_ERR, "Signal block failed: %s", strerror(errno));
     }
 
-    if (*fd != -1) {
-        close(*fd);
-        *fd = -1;
+    if (listener_fd != -1) {
+        close(listener_fd);
+        listener_fd = -1;
     }
 
     if (sigprocmask(SIG_SETMASK, &old_mask, NULL) == -1) {
@@ -140,129 +119,159 @@ void close_fd(int *fd) {
     }
 }
 
-void handle_client() {
-    size_t bytes_in, bytes_out;
-    int block_count = 0;
-    char *buf = malloc(++block_count * INET_BLOCK_SIZE + 1), *eol;
-    if (buf == NULL) {
+void handle_client(int fd_client, char *client_ip) {
+    int exit_code = EXIT_FAILURE;
+    syslog(LOG_INFO, "Accepted connection from %s", client_ip);
+
+    const int fd_data = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd_data == -1) {
+        syslog(LOG_ERR, "Unable to open data file for reading: %s", strerror(errno));
         goto exit_start;
     }
 
-    size_t received = 0;
     size_t capacity = INET_BLOCK_SIZE;
-    buf[0] = '\0';
-    while ((bytes_in = recv(fd_client, buf + received, capacity, 0)) != 0) {
-        if (bytes_in == -1) {
+    char *buf = malloc(capacity + 1);
+    if (!buf) {
+        syslog(LOG_ERR, "Failed buffer allocation: %s", strerror(errno));
+        goto exit_file;
+    }
+
+    size_t pkt_len = 0, recv_len;
+    for (;;) {
+        recv_len = recv(fd_client, buf + pkt_len, capacity - pkt_len, 0);
+        if (recv_len == -1) {
+            if (errno == EINTR) continue;;
             syslog(LOG_ERR, "Error while receiving data: %s", strerror(errno));
-            goto exit_receiving;
+            goto exit_buffer;
+        }
+        if (recv_len == 0) {
+            syslog(LOG_ERR, "Client closed without newline");
+            goto exit_buffer;
         }
 
-        eol = memchr(buf + received, '\n', bytes_in);
-        if (eol) {
-            eol[1] = '\0';
+        const char *newline = memchr(buf + pkt_len, '\n', recv_len) + 1;
+        if (newline) {
+            pkt_len = newline - buf;
             break;
         }
-        received += bytes_in;
 
-        if (bytes_in < capacity) {
-            capacity -= bytes_in;
+        pkt_len += recv_len;
+        if (pkt_len < capacity) {
             continue;
         }
 
-        char *tmp;
-        if ((tmp = realloc(buf, ++block_count * INET_BLOCK_SIZE + 1)) == NULL) {
+        capacity += INET_BLOCK_SIZE;
+        char *tmp = realloc(buf, capacity + 1);
+        if (!tmp) {
             syslog(LOG_ERR, "Failed buffer expansion: %s", strerror(errno));
-            goto exit_receiving;
+            goto exit_buffer;
         }
         buf = tmp;
-        capacity = INET_BLOCK_SIZE;
     }
 
-    if (write(fd_write, buf, strlen(buf)) == -1) {
+    if (write(fd_data, buf, pkt_len) == -1) {
         syslog(LOG_ERR, "Error while writing to temp file: %s", strerror(errno));
-        goto exit_receiving;
+        goto exit_buffer;
     }
 
-    const int fd_read = open(DATA_FILE, O_RDONLY);
-    if (fd_read == -1) {
-        syslog(LOG_ERR, "Unable to open data file for reading: %s", strerror(errno));
-        goto exit_receiving;
-    }
-    capacity = block_count * INET_BLOCK_SIZE;
-    while ((bytes_in = read(fd_read, buf, capacity)) != 0) {
-        if (bytes_in == -1) {
-            if (errno == EINTR) continue;;
+    for (;;) {
+        size_t read_len = read(fd_data, buf, capacity);
+        if (read_len == -1) {
+            if (errno == EINTR) continue;
             syslog(LOG_ERR, "Unable to read from data file: %s", strerror(errno));
-            goto exit_sending;
+            goto exit_buffer;
+        }
+        if (read_len == 0) {
+            break;
         }
 
         size_t sent = 0;
-        while (sent < bytes_in) {
-            bytes_out = send(fd_client, buf + sent, bytes_in - sent, 0);
-            if (bytes_out == -1) {
+        while (sent < read_len) {
+            const size_t send_len = send(fd_client, buf + sent, read_len - sent, 0);
+            if (send_len == -1) {
                 if (errno == EINTR) continue;;
                 syslog(LOG_ERR, "Unable to send from data file: %s", strerror(errno));
-                goto exit_sending;
+                goto exit_buffer;
             }
-            if (bytes_out == 0) {
+            if (send_len == 0) {
                 syslog(LOG_WARNING, "Client disconnected");
                 break;
             }
-            sent += bytes_out;
+            sent += send_len;
         }
     }
 
     exit_code = EXIT_SUCCESS;
 
-exit_sending:
-    close(fd_read);
-
-exit_receiving:
+exit_buffer:
     free(buf);
 
+exit_file:
+    close(fd_data);
+
 exit_start:
-    close_fd(&fd_client);
-    close_fd(&fd_write);
+    close(fd_client);
+    syslog(LOG_INFO, "Closed connection from %s", client_ip);
     exit(exit_code);
 }
 
-void run_server() {
+void to_ip(struct sockaddr_storage *client_addr, char *buf, size_t len) {
+    void *addr;
+    if (client_addr->ss_family == AF_INET) {
+        addr = &((struct sockaddr_in *) client_addr)->sin_addr;
+    } else {
+        addr = &((struct sockaddr_in6 *) client_addr)->sin6_addr;
+    }
+    inet_ntop(client_addr->ss_family, addr, buf, len);
+}
+
+int run_server() {
     struct sockaddr_storage client_addr;
     socklen_t client_len;
 
     syslog(LOG_INFO, "Waiting for connections");
-
-    while (true) {
+    for (;;) {
         client_len = sizeof(client_addr);
-        fd_client = accept(fd_listen, (struct sockaddr *) &client_addr, &client_len);
-        if (fd_client == -1) {
+        int client_fd = accept(listener_fd, (struct sockaddr *) &client_addr, &client_len);
+        if (client_fd == -1) {
             if (errno == EINTR) {
                 continue;
             }
-            syslog(LOG_INFO, "Accept failed, exiting");
-            return;
+            if (is_shutdown) {
+                return EXIT_SUCCESS;
+            }
+            syslog(LOG_INFO, "Accept failed: %s", strerror(errno));
+            return EXIT_FAILURE;
         }
 
-        log_client_ip(&client_addr);
         pid_t pid = fork();
         if (pid == -1) {
             syslog(LOG_ERR, "Fork failed: %s", strerror(errno));
-            close_fd(&fd_client);
-            return;
+            close(client_fd);
+            return EXIT_FAILURE;
         }
 
         if (pid > 0) {
             // Detach parent's reference to client_fd
-            close_fd(&fd_client);
+            close(client_fd);
         } else {
             // Detach child's reference to listen_fd
-            close_fd(&fd_listen);
-            handle_client();
+            char client_ip[INET6_ADDRSTRLEN];
+            void *addr;
+            if (client_addr.ss_family == AF_INET) {
+                addr = &((struct sockaddr_in *) &client_addr)->sin_addr;
+            } else {
+                addr = &((struct sockaddr_in6 *) &client_addr)->sin6_addr;
+            }
+            inet_ntop(client_addr.ss_family, addr, client_ip, sizeof(client_ip));
+            close_listener_fd();
+            handle_client(client_fd, client_ip);
         }
     }
 }
 
 int main(int argc, char *argv[]) {
+    int exit_code = EXIT_FAILURE;
     openlog("aesdsocket", 0, LOG_USER);
 
     if (argc == 2 && strcmp(argv[1], "-d") == 0) {
@@ -289,8 +298,8 @@ int main(int argc, char *argv[]) {
         dup(STDIN_FILENO);
     }
 
-    fd_listen = init_server();
-    if (fd_listen == -1) {
+    listener_fd = init_server();
+    if (listener_fd == -1) {
         syslog(LOG_ERR, "Unable to bind to host port");
         goto exit_server_init;
     }
@@ -300,26 +309,21 @@ int main(int argc, char *argv[]) {
         goto exit_server_init;
     }
 
-    if ((fd_write = creat(DATA_FILE, 0644)) == -1) {
-        syslog(LOG_ERR, "Unable to create socket data file: %s", strerror(errno));
-        goto exit_server_init;
-    }
-
-    if (listen(fd_listen, ACCEPT_BACKLOG) == -1) {
+    if (listen(listener_fd, ACCEPT_BACKLOG) == -1) {
         syslog(LOG_ERR, "Unable to listen: %s", strerror(errno));
         goto exit_file_init;
     }
 
-    run_server();
+    exit_code = run_server();
 
 exit_file_init:
-    close_fd(&fd_write);
     if (remove(DATA_FILE) == -1) {
         syslog(LOG_ERR, "Unable to remove data file: %s", strerror(errno));
     }
 
 exit_server_init:
-    close_fd(&fd_listen);
+    close_listener_fd();
+    while (waitpid(-1, NULL, WNOHANG) > 0);
 
 exit_start:
     syslog(LOG_INFO, "Exiting");
