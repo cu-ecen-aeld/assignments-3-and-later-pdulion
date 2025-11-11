@@ -120,24 +120,19 @@ void await_child_processes() {
         syslog(LOG_ERR, "Signal block failed: %s", strerror(errno));
     }
 
-    while (waitpid(-1, NULL, 0) > 0) {}
+    while (waitpid(-1, NULL, 0) > 0) {
+    }
 }
 
 void connection_handler(int fd_client, char *client_host) {
     int exit_code = EXIT_FAILURE;
     syslog(LOG_INFO, "Accepted connection from %s", client_host);
 
-    const int fd_data = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd_data == -1) {
-        syslog(LOG_ERR, "Unable to open data file for reading: %s", strerror(errno));
-        goto exit_start;
-    }
-
     size_t capacity = INET_BLOCK_SIZE;
     char *buf = malloc(capacity + 1);
     if (!buf) {
         syslog(LOG_ERR, "Failed buffer allocation: %s", strerror(errno));
-        goto exit_file;
+        goto exit_start;
     }
 
     size_t pkt_len = 0, recv_len;
@@ -153,9 +148,10 @@ void connection_handler(int fd_client, char *client_host) {
             goto exit_buffer;
         }
 
-        const char *newline = memchr(buf + pkt_len, '\n', recv_len) + 1;
+        const char *newline = memchr(buf + pkt_len, '\n', recv_len);
         if (newline) {
-            pkt_len = newline - buf;
+            // Add 1 to include newline in packet
+            pkt_len = (size_t) (newline - buf + 1);
             break;
         }
 
@@ -173,9 +169,20 @@ void connection_handler(int fd_client, char *client_host) {
         buf = tmp;
     }
 
-    if (write(fd_data, buf, pkt_len) == -1) {
-        syslog(LOG_ERR, "Error while writing to temp file: %s", strerror(errno));
+    const int fd_data = open(DATA_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
+    if (fd_data == -1) {
+        syslog(LOG_ERR, "Unable to open data file for reading: %s", strerror(errno));
         goto exit_buffer;
+    }
+
+    if (write(fd_data, buf, pkt_len) == -1) {
+        syslog(LOG_ERR, "Unable to write to temp file: %d - %s", errno, strerror(errno));
+        goto exit_file;
+    }
+
+    if (lseek(fd_data, 0, SEEK_SET) == -1) {
+        syslog(LOG_ERR, "Unable to move to start of file: %s", strerror(errno));
+        goto exit_file;
     }
 
     for (;;) {
@@ -183,7 +190,7 @@ void connection_handler(int fd_client, char *client_host) {
         if (read_len == -1) {
             if (errno == EINTR) continue;
             syslog(LOG_ERR, "Unable to read from data file: %s", strerror(errno));
-            goto exit_buffer;
+            goto exit_file;
         }
         if (read_len == 0) {
             break;
@@ -195,7 +202,7 @@ void connection_handler(int fd_client, char *client_host) {
             if (send_len == -1) {
                 if (errno == EINTR) continue;;
                 syslog(LOG_ERR, "Unable to send from data file: %s", strerror(errno));
-                goto exit_buffer;
+                goto exit_file;
             }
             if (send_len == 0) {
                 syslog(LOG_WARNING, "Client disconnected");
@@ -207,11 +214,11 @@ void connection_handler(int fd_client, char *client_host) {
 
     exit_code = EXIT_SUCCESS;
 
-exit_buffer:
-    free(buf);
-
 exit_file:
     close(fd_data);
+
+exit_buffer:
+    free(buf);
 
 exit_start:
     close(fd_client);
