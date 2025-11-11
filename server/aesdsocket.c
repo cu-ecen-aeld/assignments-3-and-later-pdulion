@@ -2,18 +2,19 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <features.h>
+#include <linux/limits.h>
 #include <netdb.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <syslog.h>
 #include <unistd.h>
-#include <linux/limits.h>
 
 #define ACCEPT_BACKLOG 10
 
@@ -128,14 +129,14 @@ void connection_handler(int fd_client, char *client_host) {
     int exit_code = EXIT_FAILURE;
     syslog(LOG_INFO, "Accepted connection from %s", client_host);
 
-    size_t capacity = INET_BLOCK_SIZE;
-    char *buf = malloc(capacity + 1);
+    ssize_t capacity = INET_BLOCK_SIZE;
+    char *buf = malloc(capacity);
     if (!buf) {
         syslog(LOG_ERR, "Failed buffer allocation: %s", strerror(errno));
         goto exit_start;
     }
 
-    size_t pkt_len = 0, recv_len;
+    ssize_t pkt_len = 0, recv_len;
     for (;;) {
         recv_len = recv(fd_client, buf + pkt_len, capacity - pkt_len, 0);
         if (recv_len == -1) {
@@ -151,7 +152,7 @@ void connection_handler(int fd_client, char *client_host) {
         const char *newline = memchr(buf + pkt_len, '\n', recv_len);
         if (newline) {
             // Add 1 to include newline in packet
-            pkt_len = (size_t) (newline - buf + 1);
+            pkt_len = newline - buf + 1;
             break;
         }
 
@@ -161,7 +162,7 @@ void connection_handler(int fd_client, char *client_host) {
         }
 
         capacity += INET_BLOCK_SIZE;
-        char *tmp = realloc(buf, capacity + 1);
+        char *tmp = realloc(buf, capacity);
         if (!tmp) {
             syslog(LOG_ERR, "Failed buffer expansion: %s", strerror(errno));
             goto exit_buffer;
@@ -175,34 +176,39 @@ void connection_handler(int fd_client, char *client_host) {
         goto exit_buffer;
     }
 
+    if (flock(fd_data, LOCK_EX) == -1) {
+        syslog(LOG_ERR, "Unable to lock temp file: %d - %s", errno, strerror(errno));
+        goto exit_file;
+    }
+
     if (write(fd_data, buf, pkt_len) == -1) {
         syslog(LOG_ERR, "Unable to write to temp file: %d - %s", errno, strerror(errno));
-        goto exit_file;
+        goto exit_lock;
     }
 
     if (lseek(fd_data, 0, SEEK_SET) == -1) {
         syslog(LOG_ERR, "Unable to move to start of file: %s", strerror(errno));
-        goto exit_file;
+        goto exit_lock;
     }
 
     for (;;) {
-        size_t read_len = read(fd_data, buf, capacity);
+        ssize_t read_len = read(fd_data, buf, capacity);
         if (read_len == -1) {
             if (errno == EINTR) continue;
             syslog(LOG_ERR, "Unable to read from data file: %s", strerror(errno));
-            goto exit_file;
+            goto exit_lock;
         }
         if (read_len == 0) {
             break;
         }
 
-        size_t sent = 0;
+        ssize_t sent = 0;
         while (sent < read_len) {
-            const size_t send_len = send(fd_client, buf + sent, read_len - sent, 0);
+            const ssize_t send_len = send(fd_client, buf + sent, read_len - sent, 0);
             if (send_len == -1) {
                 if (errno == EINTR) continue;;
                 syslog(LOG_ERR, "Unable to send from data file: %s", strerror(errno));
-                goto exit_file;
+                goto exit_lock;
             }
             if (send_len == 0) {
                 syslog(LOG_WARNING, "Client disconnected");
@@ -213,6 +219,9 @@ void connection_handler(int fd_client, char *client_host) {
     }
 
     exit_code = EXIT_SUCCESS;
+
+exit_lock:
+    flock(fd_data, LOCK_UN);
 
 exit_file:
     close(fd_data);
