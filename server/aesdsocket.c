@@ -30,7 +30,7 @@ int init_server() {
     int rc;
     struct addrinfo hints = {0}, *info;
 
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
 
@@ -264,19 +264,19 @@ int main(int argc, char *argv[]) {
         pid_t pid = fork();
         if (pid == -1) {
             syslog(LOG_ERR, "Fork failed: %s", strerror(errno));
-            goto exit_syslog;
+            goto exit_start;
         }
         if (pid > 0) {
             exit_code = EXIT_SUCCESS;
-            goto exit_syslog;
+            goto exit_start;
         }
         if (setsid() == -1) {
             syslog(LOG_ERR, "Failed to create new session and process group: %s", strerror(errno));
-            goto exit_syslog;
+            goto exit_start;
         }
         if (chdir("/") == -1) {
             syslog(LOG_ERR, "Failed to change directory to /");
-            goto exit_syslog;
+            goto exit_start;
         }
         for (int i = 0; i < NR_OPEN; i++) close(i);
         open("/dev/null", O_RDWR);
@@ -287,36 +287,36 @@ int main(int argc, char *argv[]) {
     fd_listen = init_server();
     if (fd_listen == -1) {
         syslog(LOG_ERR, "Unable to bind to host port");
-        goto exit_data_fd;
+        goto exit_server_init;
     }
 
     if (init_signals() == -1) {
         syslog(LOG_ERR, "Unable to configure signal handling: %s", strerror(errno));
-        goto exit_server_fd;
+        goto exit_server_init;
     }
 
     if ((fd_write = creat(DATA_FILE, 0644)) == -1) {
         syslog(LOG_ERR, "Unable to create socket data file: %s", strerror(errno));
-        goto exit_syslog;
+        goto exit_server_init;
     }
 
     if (listen(fd_listen, ACCEPT_BACKLOG) == -1) {
         syslog(LOG_ERR, "Unable to listen: %s", strerror(errno));
-        goto exit_server_fd;
+        goto exit_file_init;
     }
 
     run_server();
 
-exit_data_fd:
+exit_file_init:
     close_fd(&fd_write);
     if (remove(DATA_FILE) == -1) {
         syslog(LOG_ERR, "Unable to remove data file: %s", strerror(errno));
     }
 
-exit_server_fd:
+exit_server_init:
     close_fd(&fd_listen);
 
-exit_syslog:
+exit_start:
     syslog(LOG_INFO, "Exiting");
     closelog();
 
