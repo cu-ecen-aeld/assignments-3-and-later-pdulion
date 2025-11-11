@@ -142,13 +142,12 @@ void close_fd(int *fd) {
 
 void handle_client() {
     size_t bytes_in, bytes_out;
-
-    char *buf = malloc(INET_BLOCK_SIZE + 1);
+    int block_count = 0;
+    char *buf = malloc(++block_count * INET_BLOCK_SIZE + 1), *eol;
     if (buf == NULL) {
         goto exit_start;
     }
 
-    int block_count = 0;
     size_t received = 0;
     size_t capacity = INET_BLOCK_SIZE;
     buf[0] = '\0';
@@ -158,8 +157,9 @@ void handle_client() {
             goto exit_receiving;
         }
 
-        buf[received + bytes_in] = '\0';
-        if (strchr(buf + received, '\n')) {
+        eol = memchr(buf + received, '\n', bytes_in);
+        if (eol) {
+            eol[1] = '\0';
             break;
         }
         received += bytes_in;
@@ -183,7 +183,11 @@ void handle_client() {
         goto exit_receiving;
     }
 
-    int fd_read = open(DATA_FILE, O_RDONLY);
+    const int fd_read = open(DATA_FILE, O_RDONLY);
+    if (fd_read == -1) {
+        syslog(LOG_ERR, "Unable to open data file for reading: %s", strerror(errno));
+        goto exit_receiving;
+    }
     capacity = block_count * INET_BLOCK_SIZE;
     while ((bytes_in = read(fd_read, buf, capacity)) != 0) {
         if (bytes_in == -1) {
@@ -196,6 +200,7 @@ void handle_client() {
         while (sent < bytes_in) {
             bytes_out = send(fd_client, buf + sent, bytes_in - sent, 0);
             if (bytes_out == -1) {
+                if (errno == EINTR) continue;;
                 syslog(LOG_ERR, "Unable to send from data file: %s", strerror(errno));
                 goto exit_sending;
             }
