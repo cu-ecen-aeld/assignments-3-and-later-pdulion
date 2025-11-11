@@ -1,6 +1,9 @@
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <features.h>
 #include <netdb.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,13 +13,15 @@
 #include <sys/wait.h>
 #include <syslog.h>
 #include <unistd.h>
-#include <signal.h>
-#include <errno.h>
 
 #define ACCEPT_BACKLOG 10
 
+const char *DATA_FILE = "/var/tmp/aesdsocketdata";
+
+int exit_code = EXIT_FAILURE;
 int listen_fd = -1;
 int client_fd = -1;
+int data_fd = -1;
 
 int init_server() {
     int fd = -1;
@@ -67,10 +72,14 @@ void handle_signals(int signum) {
     if (signum == SIGCHLD) {
         while (waitpid(-1, NULL, WNOHANG) > 0);
     } else if (signum == SIGINT || signum == SIGTERM) {
-        if (client_fd > STDERR_FILENO)
-            shutdown(client_fd, SHUT_RDWR);
-        if (listen_fd > STDERR_FILENO)
-            shutdown(listen_fd, SHUT_RDWR);
+        if (client_fd != -1) shutdown(client_fd, SHUT_RDWR);
+        if (listen_fd != -1) shutdown(listen_fd, SHUT_RDWR);
+        if (data_fd != -1) {
+            close(data_fd);
+            data_fd = -1;
+        }
+
+        exit_code = EXIT_SUCCESS;
     }
 
     errno = old_errno;
@@ -108,19 +117,24 @@ void log_client_ip(struct sockaddr_storage *client_addr) {
     syslog(LOG_INFO, "Accepted connection from %s", client_ip);
 }
 
-void block_signals(sigset_t *oldmask) {
-    sigset_t set;
-    sigemptyset(&set);
-    sigaddset(&set, SIGINT);
-    sigaddset(&set, SIGTERM);
-    if (sigprocmask(SIG_BLOCK, &set, oldmask) == -1) {
-        syslog(LOG_ERR, "sigprocmask(SIG_BLOCK) failed: %s", strerror(errno));
-    }
-}
+void close_fd(int *fd) {
+    sigset_t new_mask;
+    sigset_t old_mask;
 
-void restore_signals(const sigset_t *oldmask) {
-    if (sigprocmask(SIG_SETMASK, oldmask, NULL) == -1) {
-        syslog(LOG_ERR, "sigprocmask(SIG_SETMASK) failed: %s", strerror(errno));
+    sigemptyset(&new_mask);
+    sigaddset(&new_mask, SIGINT);
+    sigaddset(&new_mask, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &new_mask, &old_mask) == -1) {
+        syslog(LOG_ERR, "Signal block failed: %s", strerror(errno));
+    }
+
+    if (*fd != -1) {
+        close(*fd);
+        *fd = -1;
+    }
+
+    if (sigprocmask(SIG_SETMASK, &old_mask, NULL) == -1) {
+        syslog(LOG_ERR, "Signal restoration failed: %s", strerror(errno));
     }
 }
 
@@ -128,14 +142,16 @@ void handle_client() {
     if (send(client_fd, "Hello, world!", 13, 0) == -1) {
         syslog(LOG_ERR, "Send failed: %s", strerror(errno));
     }
-    close(client_fd);
-    exit(0);
+
+
+    close_fd(&client_fd);
+    close_fd(&data_fd);
+    exit(EXIT_SUCCESS);
 }
 
 void run_server() {
     struct sockaddr_storage client_addr;
     socklen_t client_len;
-    sigset_t old_mask;
 
     syslog(LOG_INFO, "Waiting for connections");
 
@@ -147,36 +163,28 @@ void run_server() {
                 continue;
             }
             syslog(LOG_INFO, "Accept failed, exiting");
-            break;
+            return;
         }
 
         log_client_ip(&client_addr);
         pid_t pid = fork();
         if (pid == -1) {
             syslog(LOG_ERR, "Fork failed: %s", strerror(errno));
-            break;
+            return;
         }
 
         if (pid > 0) {
             // Detach parent's reference to client_fd
-            block_signals(&old_mask);
-            close(client_fd);
-            client_fd = -1;
-            restore_signals(&old_mask);
+            close_fd(&client_fd);
         } else {
             // Detach child's reference to listen_fd
-            block_signals(&old_mask);
-            close(listen_fd);
-            listen_fd = -1;
-            restore_signals(&old_mask);
-
+            close_fd(&listen_fd);
             handle_client();
         }
     }
 }
 
 int main(int argc, char *argv[]) {
-    int exit_code = EXIT_FAILURE;
     openlog("aesdsocket", 0, LOG_USER);
     bool daemonize = false;
 
@@ -192,12 +200,17 @@ int main(int argc, char *argv[]) {
     listen_fd = init_server();
     if (listen_fd == -1) {
         syslog(LOG_ERR, "Unable to bind to host port");
-        goto error_syslog;
+        goto error_data_fd;
     }
 
     if (init_signals() == -1) {
         syslog(LOG_ERR, "Unable to configure signal handling: %s", strerror(errno));
         goto error_server_fd;
+    }
+
+    if ((data_fd = creat(DATA_FILE, 0644)) == -1) {
+        syslog(LOG_ERR, "Unable to create socket data file: %s", strerror(errno));
+        goto error_syslog;
     }
 
     if (listen(listen_fd, ACCEPT_BACKLOG) == -1) {
@@ -206,13 +219,20 @@ int main(int argc, char *argv[]) {
     }
 
     run_server();
-    exit_code = EXIT_SUCCESS;
+
+error_data_fd:
+    close_fd(&data_fd);
+    if (remove(DATA_FILE) == -1) {
+        syslog(LOG_ERR, "Unable to remove data file: %s", strerror(errno));
+    }
 
 error_server_fd:
-    close(listen_fd);
+    close_fd(&listen_fd);
 
 error_syslog:
     syslog(LOG_INFO, "Exiting");
     closelog();
+
+    // Set to EXIT_SUCCESS by SIGTERM and SIGINT in handle_signals()
     return exit_code;
 }
