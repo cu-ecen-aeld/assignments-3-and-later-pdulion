@@ -27,7 +27,6 @@ int init_server() {
     int fd = -1;
     int rc;
     struct addrinfo hints = {0}, *info;
-
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
@@ -66,7 +65,7 @@ exit_start:
     return fd;
 }
 
-void handle_signals(int signum) {
+void signal_handler(int signum) {
     const int old_errno = errno;
 
     if (signum == SIGCHLD) {
@@ -82,20 +81,13 @@ void handle_signals(int signum) {
 int init_signals() {
     struct sigaction sa;
 
-    sa.sa_handler = handle_signals;
+    sa.sa_handler = signal_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
     if (sigaction(SIGINT, &sa, NULL) == -1) return -1;
     if (sigaction(SIGTERM, &sa, NULL) == -1) return -1;
     if (sigaction(SIGCHLD, &sa, NULL) == -1) return -1;
     return 0;
-}
-
-void *get_addr(struct sockaddr *sa) {
-    if (sa->sa_family == AF_INET) {
-        return &((struct sockaddr_in *) sa)->sin_addr;
-    }
-    return &((struct sockaddr_in6 *) sa)->sin6_addr;
 }
 
 void close_listener_fd() {
@@ -119,9 +111,21 @@ void close_listener_fd() {
     }
 }
 
-void handle_client(int fd_client, char *client_ip) {
+void await_child_processes() {
+    sigset_t new_mask;
+
+    sigemptyset(&new_mask);
+    sigaddset(&new_mask, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &new_mask, NULL) == -1) {
+        syslog(LOG_ERR, "Signal block failed: %s", strerror(errno));
+    }
+
+    while (waitpid(-1, NULL, 0) > 0) {}
+}
+
+void connection_handler(int fd_client, char *client_host) {
     int exit_code = EXIT_FAILURE;
-    syslog(LOG_INFO, "Accepted connection from %s", client_ip);
+    syslog(LOG_INFO, "Accepted connection from %s", client_host);
 
     const int fd_data = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd_data == -1) {
@@ -211,18 +215,8 @@ exit_file:
 
 exit_start:
     close(fd_client);
-    syslog(LOG_INFO, "Closed connection from %s", client_ip);
+    syslog(LOG_INFO, "Closed connection from %s", client_host);
     exit(exit_code);
-}
-
-void to_ip(struct sockaddr_storage *client_addr, char *buf, size_t len) {
-    void *addr;
-    if (client_addr->ss_family == AF_INET) {
-        addr = &((struct sockaddr_in *) client_addr)->sin_addr;
-    } else {
-        addr = &((struct sockaddr_in6 *) client_addr)->sin6_addr;
-    }
-    inet_ntop(client_addr->ss_family, addr, buf, len);
 }
 
 int run_server() {
@@ -256,16 +250,16 @@ int run_server() {
             close(client_fd);
         } else {
             // Detach child's reference to listen_fd
-            char client_ip[INET6_ADDRSTRLEN];
+            char client_host[INET6_ADDRSTRLEN];
             void *addr;
             if (client_addr.ss_family == AF_INET) {
                 addr = &((struct sockaddr_in *) &client_addr)->sin_addr;
             } else {
                 addr = &((struct sockaddr_in6 *) &client_addr)->sin6_addr;
             }
-            inet_ntop(client_addr.ss_family, addr, client_ip, sizeof(client_ip));
+            inet_ntop(client_addr.ss_family, addr, client_host, sizeof(client_host));
             close_listener_fd();
-            handle_client(client_fd, client_ip);
+            connection_handler(client_fd, client_host);
         }
     }
 }
@@ -281,9 +275,11 @@ int main(int argc, char *argv[]) {
             goto exit_start;
         }
         if (pid > 0) {
+            // Parent: Daemon successfully created
             exit_code = EXIT_SUCCESS;
             goto exit_start;
         }
+        // Child: Configure for Daemon mode!
         if (setsid() == -1) {
             syslog(LOG_ERR, "Failed to create new session and process group: %s", strerror(errno));
             goto exit_start;
@@ -310,11 +306,12 @@ int main(int argc, char *argv[]) {
     }
 
     if (listen(listener_fd, ACCEPT_BACKLOG) == -1) {
-        syslog(LOG_ERR, "Unable to listen: %s", strerror(errno));
+        syslog(LOG_ERR, "Unable to listen for connections: %s", strerror(errno));
         goto exit_file_init;
     }
 
     exit_code = run_server();
+    await_child_processes();
 
 exit_file_init:
     if (remove(DATA_FILE) == -1) {
@@ -323,7 +320,6 @@ exit_file_init:
 
 exit_server_init:
     close_listener_fd();
-    while (waitpid(-1, NULL, WNOHANG) > 0);
 
 exit_start:
     syslog(LOG_INFO, "Exiting");
