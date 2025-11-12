@@ -1,10 +1,10 @@
 *.o
-writer
+.idea/
+.vscode/
 Test_*_Runner.c
+aesd-build
+aesdsocket
 build/
 crosstool-ng
-aesd-build
-.vscode/
 test.sh.log
-.idea/
-aesdsocket
+writer
