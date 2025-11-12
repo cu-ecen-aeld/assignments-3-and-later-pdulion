@@ -1,7 +1,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <features.h>
 #include <netdb.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -19,13 +18,13 @@
 
 #define ACCEPT_BACKLOG 10
 
-const char *DATA_FILE = "/var/tmp/aesdsocketdata";
-const int INET_BLOCK_SIZE = 1024;
+static const char *DATA_FILE = "/var/tmp/aesdsocketdata";
+static const size_t INET_BLOCK_SIZE = 1024;
 
 volatile sig_atomic_t g_shutdown = false;
 int listener_fd = -1;
 
-int daemonize() {
+static int daemonize() {
     pid_t pid = fork();
     if (pid == -1) {
         syslog(LOG_ERR, "Failed to create daemon process: %s", strerror(errno));
@@ -58,7 +57,7 @@ int daemonize() {
 
     const int fd = open("/dev/null", O_RDWR);
     if (fd == -1) {
-        syslog(LOG_ERR, "Failed limit for open files: %s", strerror(errno));
+        syslog(LOG_ERR, "Failed to open /dev/null: %s", strerror(errno));
         return -1;
     }
     dup2(fd, STDIN_FILENO);
@@ -69,28 +68,18 @@ int daemonize() {
     return 0;
 }
 
-void shutdown_handler(int signum) {
-    const int old_errno = errno;
-
+static void shutdown_handler(int signum) {
     if (signum == SIGINT || signum == SIGTERM) {
+        // Signal triggers EINTR during accept
         g_shutdown = true;
-        if (listener_fd >= 0) shutdown(listener_fd, SHUT_RDWR);
     }
-
-    errno = old_errno;
 }
 
-void child_exit_handler(int signum) {
-    const int old_errno = errno;
-
-    if (signum == SIGCHLD) {
-        while (waitpid(-1, NULL, WNOHANG) > 0);
-    }
-
-    errno = old_errno;
+static void child_exit_handler(int signum) {
+    // Do nothing, Let EINTR handle cleanup
 }
 
-int init_signals() {
+static int init_signals() {
     struct sigaction sa;
 
     sigemptyset(&sa.sa_mask);
@@ -100,7 +89,7 @@ int init_signals() {
     if (sigaction(SIGTERM, &sa, NULL) == -1) return -1;
 
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
+    sa.sa_flags = 0;
     sa.sa_handler = child_exit_handler;
     if (sigaction(SIGCHLD, &sa, NULL) == -1) return -1;
 
@@ -112,7 +101,7 @@ int init_signals() {
     return 0;
 }
 
-int open_listener() {
+static int open_listener() {
     int fd = -1;
     int rc;
     struct addrinfo hints = {0}, *info;
@@ -154,7 +143,7 @@ exit_start:
     return fd;
 }
 
-void close_listener() {
+static void close_listener() {
     sigset_t new_mask;
     sigset_t old_mask;
 
@@ -175,7 +164,24 @@ void close_listener() {
     }
 }
 
-void await_child_processes() {
+static void reap_children(int options) {
+    pid_t pid;
+    int status;
+
+    while ((pid = waitpid(-1, &status, options)) > 0) {
+        if (WIFEXITED(status)) {
+            syslog(LOG_INFO, "Child process %d exited with status %d\n", pid, WEXITSTATUS(status));
+        } else if (WIFSIGNALED(status)) {
+            syslog(LOG_INFO, "Child process %d was terminated by signal %d\n", pid, WTERMSIG(status));
+        } else if (WIFSTOPPED(status)) {
+            syslog(LOG_INFO, "Child process %d was stopped by signal %d\n", pid, WSTOPSIG(status));
+        } else {
+            syslog(LOG_WARNING, "Child process %d did not exit successfully\n", pid);
+        }
+    }
+}
+
+static void await_child_processes() {
     sigset_t new_mask;
     sigset_t old_mask;
 
@@ -185,15 +191,14 @@ void await_child_processes() {
         syslog(LOG_ERR, "Signal block failed: %s", strerror(errno));
     }
 
-    while (waitpid(-1, NULL, 0) > 0) {
-    }
+    reap_children(0);
 
     if (sigprocmask(SIG_SETMASK, &old_mask, NULL) == -1) {
         syslog(LOG_ERR, "Signal restoration failed: %s", strerror(errno));
     }
 }
 
-void connection_handler(const int fd_client, const char *client_host) {
+static void connection_handler(const int fd_client, const char *client_host) {
     int exit_code = EXIT_FAILURE;
     syslog(LOG_INFO, "Accepted connection from %s", client_host);
 
@@ -252,6 +257,7 @@ void connection_handler(const int fd_client, const char *client_host) {
     for (size_t written = 0; written < pkt_len;) {
         const ssize_t write_len = write(fd_data, buf + written, pkt_len - written);
         if (write_len == -1) {
+            if (errno == EINTR) continue;
             syslog(LOG_ERR, "Unable to write to data file: %d - %s", errno, strerror(errno));
             goto exit_lock;
         }
@@ -299,10 +305,10 @@ exit_buffer:
 exit_start:
     close(fd_client);
     syslog(LOG_INFO, "Closed connection from %s", client_host);
-    exit(exit_code);
+    _exit(exit_code);
 }
 
-void run_server() {
+static void run_server() {
     struct sockaddr_storage client_addr;
     socklen_t client_len;
 
@@ -311,9 +317,12 @@ void run_server() {
         client_len = sizeof(client_addr);
         int client_fd = accept(listener_fd, (struct sockaddr *) &client_addr, &client_len);
         if (client_fd == -1) {
-            if (errno == EINTR) continue;
-            if (g_shutdown) return;
-            if (errno == ECONNABORTED || errno == EPROTO || errno == ENETDOWN /* etc. */) {
+            if (errno == EINTR) {
+                if (g_shutdown) return;
+                reap_children(WNOHANG);
+                continue;
+            }
+            if (errno == ECONNABORTED || errno == EPROTO || errno == ENETDOWN) {
                 syslog(LOG_WARNING, "Accept transient error: %s", strerror(errno));
                 continue;
             }
@@ -354,7 +363,7 @@ void run_server() {
 
 int main(int argc, char *argv[]) {
     int exit_code = EXIT_FAILURE;
-    openlog("aesdsocket", 0, LOG_USER);
+    openlog("aesdsocket", LOG_PID, LOG_USER);
 
     if (argc == 2 && strcmp(argv[1], "-d") == 0) {
         if (daemonize() == -1) {
@@ -379,14 +388,13 @@ int main(int argc, char *argv[]) {
     }
 
     run_server();
+    await_child_processes();
     if (g_shutdown) {
         syslog(LOG_INFO, "Caught signal, exiting");
         exit_code = EXIT_SUCCESS;
-    }
-
-    await_child_processes();
-    if (remove(DATA_FILE) == -1 && errno != ENOENT) {
-        syslog(LOG_ERR, "Unable to remove %s: %s", DATA_FILE, strerror(errno));
+        if (remove(DATA_FILE) == -1 && errno != ENOENT) {
+            syslog(LOG_ERR, "Unable to remove %s: %s", DATA_FILE, strerror(errno));
+        }
     }
 
 exit_server_init:
