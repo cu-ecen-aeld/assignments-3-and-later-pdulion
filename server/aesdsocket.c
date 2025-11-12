@@ -316,12 +316,11 @@ static void run_server() {
     socklen_t client_len;
 
     syslog(LOG_INFO, "Waiting for connections");
-    for (;;) {
+    while (!g_shutdown) {
         client_len = sizeof(client_addr);
-        int client_fd = accept(listener_fd, (struct sockaddr *) &client_addr, &client_len);
+        const int client_fd = accept(listener_fd, (struct sockaddr *) &client_addr, &client_len);
         if (client_fd == -1) {
             if (errno == EINTR) {
-                if (g_shutdown) return;
                 reap_children(WNOHANG);
                 continue;
             }
