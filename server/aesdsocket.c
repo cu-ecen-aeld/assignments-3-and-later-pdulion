@@ -33,6 +33,9 @@ static int daemonize() {
     if (pid > 0) {
         // Parent: Daemon successfully created
         closelog();
+
+        // Sleep a moment before exiting to make sure child is listening
+        sleep(1);
         _exit(EXIT_SUCCESS);
     }
 
