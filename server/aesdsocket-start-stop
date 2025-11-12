@@ -1,0 +1,70 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          aesdsocket
+# Required-Start:    $local_fs $network $named $time $syslog
+# Required-Stop:     $local_fs $network $named $time $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Start/stop aesdsocket daemon
+# Description:       Controls the aesdsocket daemon for handling AESD char device communication over TCP
+### END INIT INFO
+
+set -e
+
+NAME="aesdsocket"
+DAEMON="/usr/bin/aesdsocket"
+DAEMON_ARGS="-d"
+STOP_SIGNAL="TERM"
+PIDFILE="/var/run/aesdsocket.pid"
+
+. /etc/init.d/functions
+
+do_start() {
+    echo "Starting $NAME..."
+    start-stop-daemon --start --quiet --make-pidfile --pidfile $PIDFILE --exec $DAEMON -- $DAEMON_ARGS
+    log_end_msg $?
+}
+
+do_stop() {
+    echo "Stopping $NAME..."
+    start-stop-daemon --stop --quiet --remove-pidfile --pidfile $PIDFILE --signal $STOP_SIGNAL --oknodo
+    log_end_msg $?
+}
+
+do_status() {
+    if [ -f $PIDFILE ]; then
+        PID=$(cat $PIDFILE)
+        if ps -p $PID > /dev/null 2>&1; then
+            echo "$NAME is running (pid $PID)"
+            return 0
+        else
+            echo "$NAME is not running, but pid file exists"
+            return 1
+        fi
+    else
+        echo "$NAME is not running"
+        return 3
+    fi
+}
+
+case "$1" in
+    start)
+        do_start
+        ;;
+    stop)
+        do_stop
+        ;;
+    status)
+        do_status
+        ;;
+    restart|force-reload)
+        do_stop
+        do_start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|status|restart|force-reload}"
+        exit 1
+        ;;
+esac
+
+exit 0
