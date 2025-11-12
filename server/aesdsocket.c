@@ -128,12 +128,14 @@ static int open_listener() {
         if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1) {
             syslog(LOG_ERR, "Failed setting socket options: %s", strerror(errno));
             close(fd);
+            fd = -1;
             continue;
         }
 
         if (bind(fd, entry->ai_addr, entry->ai_addrlen) == -1) {
-            close(fd);
             syslog(LOG_ERR, "Failed to bind socket: %s", strerror(errno));
+            close(fd);
+            fd = -1;
             continue;
         }
 
@@ -173,13 +175,13 @@ static void reap_children(int options) {
 
     while ((pid = waitpid(-1, &status, options)) > 0) {
         if (WIFEXITED(status)) {
-            syslog(LOG_INFO, "Child process %d exited with status %d\n", pid, WEXITSTATUS(status));
+            syslog(LOG_INFO, "Child process %d exited with status %d", pid, WEXITSTATUS(status));
         } else if (WIFSIGNALED(status)) {
-            syslog(LOG_INFO, "Child process %d was terminated by signal %d\n", pid, WTERMSIG(status));
+            syslog(LOG_INFO, "Child process %d was terminated by signal %d", pid, WTERMSIG(status));
         } else if (WIFSTOPPED(status)) {
-            syslog(LOG_INFO, "Child process %d was stopped by signal %d\n", pid, WSTOPSIG(status));
+            syslog(LOG_INFO, "Child process %d was stopped by signal %d", pid, WSTOPSIG(status));
         } else {
-            syslog(LOG_WARNING, "Child process %d did not exit successfully\n", pid);
+            syslog(LOG_WARNING, "Child process %d did not exit successfully", pid);
         }
     }
 }
