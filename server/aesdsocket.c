@@ -25,50 +25,66 @@ volatile sig_atomic_t g_shutdown = false;
 int listener_fd = -1;
 
 static int daemonize() {
+    int pipe_fds[2];
+    if (pipe(pipe_fds) == -1) {
+        syslog(LOG_ERR, "Failed to create daemon process: %s", strerror(errno));
+        return -1;
+    }
+
     pid_t pid = fork();
     if (pid == -1) {
         syslog(LOG_ERR, "Failed to create daemon process: %s", strerror(errno));
         return -1;
     }
     if (pid > 0) {
-        // Parent: Daemon successfully created
-        closelog();
+        // Parent: Daemon successfully created, wait for it to initialize
+        int daemon_started;
 
-        // Sleep a moment before exiting to make sure child is listening
-        sleep(1);
-        _exit(EXIT_SUCCESS);
+        close(pipe_fds[1]);
+        read(pipe_fds[0], &daemon_started, sizeof(daemon_started));
+        close(pipe_fds[0]);
+        closelog();
+        _exit(daemon_started ? EXIT_SUCCESS : EXIT_FAILURE);
     }
 
     // Child: Configure for Daemon mode!
     if (setsid() == -1) {
         syslog(LOG_ERR, "Failed to create new session and process group: %s", strerror(errno));
-        return -1;
+        goto fail;
     }
 
     umask(0);
     if (chdir("/") == -1) {
         syslog(LOG_ERR, "Failed changing to root directory: %s", strerror(errno));
-        return -1;
+        goto fail;
     }
 
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == -1) {
         syslog(LOG_ERR, "Failed limit for open files: %s", strerror(errno));
-        return -1;
+        goto fail;
     }
-    for (int i = 0; i < (int) rl.rlim_max; i++) close(i);
+
+    close(pipe_fds[0]);
+    close(STDIN_FILENO);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
 
     const int fd = open("/dev/null", O_RDWR);
     if (fd == -1) {
         syslog(LOG_ERR, "Failed to open /dev/null: %s", strerror(errno));
-        return -1;
+        goto fail;
     }
     dup2(fd, STDIN_FILENO);
     dup2(fd, STDOUT_FILENO);
     dup2(fd, STDERR_FILENO);
     if (fd > STDERR_FILENO) close(fd);
 
-    return 0;
+    return pipe_fds[1];
+
+fail:
+    close(pipe_fds[1]);
+    return -1;
 }
 
 static void shutdown_handler(int signum) {
@@ -369,8 +385,10 @@ int main(int argc, char *argv[]) {
     int exit_code = EXIT_FAILURE;
     openlog("aesdsocket", LOG_PID, LOG_USER);
 
+    int pipe_fd = -1;
     if (argc == 2 && strcmp(argv[1], "-d") == 0) {
-        if (daemonize() == -1) {
+        pipe_fd = daemonize();
+        if (pipe_fd == -1) {
             goto exit_start;
         }
     }
@@ -391,6 +409,13 @@ int main(int argc, char *argv[]) {
         goto exit_server_init;
     }
 
+    if (pipe_fd != -1) {
+        const int daemon_started = 1;
+        write(pipe_fd, &daemon_started, sizeof(daemon_started));
+        close(pipe_fd);
+        pipe_fd = -1;
+    }
+
     run_server();
     await_child_processes();
     if (g_shutdown) {
@@ -405,6 +430,12 @@ exit_server_init:
     close_listener();
 
 exit_start:
+    if (pipe_fd != -1) {
+        const int daemon_started = 0;
+        write(pipe_fd, &daemon_started, sizeof(daemon_started));
+        close(pipe_fd);
+        pipe_fd = -1;
+    }
     closelog();
 
     // Set to EXIT_SUCCESS by SIGTERM and SIGINT in handle_signals()
