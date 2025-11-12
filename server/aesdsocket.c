@@ -8,7 +8,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
-#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -27,21 +26,23 @@ int listener_fd = -1;
 static int daemonize() {
     int pipe_fds[2];
     if (pipe(pipe_fds) == -1) {
-        syslog(LOG_ERR, "Failed to create daemon process: %s", strerror(errno));
+        syslog(LOG_ERR, "Unable to create pipe for daemon child: %s", strerror(errno));
         return -1;
     }
 
     pid_t pid = fork();
     if (pid == -1) {
-        syslog(LOG_ERR, "Failed to create daemon process: %s", strerror(errno));
-        return -1;
+        syslog(LOG_ERR, "Unable to create daemon process: %s", strerror(errno));
+        close(pipe_fds[0]);
+        goto fail;
     }
     if (pid > 0) {
-        // Parent: Daemon successfully created, wait for it to initialize
+        // Parent: Daemon child successfully created, now wait for it to initialize
         int daemon_started;
-
-        close(pipe_fds[1]);
         read(pipe_fds[0], &daemon_started, sizeof(daemon_started));
+
+        // Daemon child has indicated initialization or failure, so let's return to caller
+        close(pipe_fds[1]);
         close(pipe_fds[0]);
         closelog();
         _exit(daemon_started ? EXIT_SUCCESS : EXIT_FAILURE);
@@ -49,19 +50,13 @@ static int daemonize() {
 
     // Child: Configure for Daemon mode!
     if (setsid() == -1) {
-        syslog(LOG_ERR, "Failed to create new session and process group: %s", strerror(errno));
+        syslog(LOG_ERR, "Unable to create new session and process group: %s", strerror(errno));
         goto fail;
     }
 
     umask(0);
     if (chdir("/") == -1) {
-        syslog(LOG_ERR, "Failed changing to root directory: %s", strerror(errno));
-        goto fail;
-    }
-
-    struct rlimit rl;
-    if (getrlimit(RLIMIT_NOFILE, &rl) == -1) {
-        syslog(LOG_ERR, "Failed limit for open files: %s", strerror(errno));
+        syslog(LOG_ERR, "Unable to change to root directory: %s", strerror(errno));
         goto fail;
     }
 
@@ -72,7 +67,7 @@ static int daemonize() {
 
     const int fd = open("/dev/null", O_RDWR);
     if (fd == -1) {
-        syslog(LOG_ERR, "Failed to open /dev/null: %s", strerror(errno));
+        syslog(LOG_ERR, "Unable to open /dev/null: %s", strerror(errno));
         goto fail;
     }
     dup2(fd, STDIN_FILENO);
@@ -89,13 +84,13 @@ fail:
 
 static void shutdown_handler(int signum) {
     if (signum == SIGINT || signum == SIGTERM) {
-        // Signal triggers EINTR during accept
+        // Indicate shutdown, let EINTR handle shutdown in accept loop.
         g_shutdown = true;
     }
 }
 
 static void child_exit_handler(int signum) {
-    // Do nothing, Let EINTR handle cleanup
+    // Do nothing, let EINTR handle cleanup in accept loop.
 }
 
 static int init_signals() {
@@ -129,7 +124,7 @@ static int open_listener() {
     hints.ai_flags = AI_PASSIVE;
 
     if ((rc = getaddrinfo(NULL, "9000", &hints, &info)) != 0) {
-        syslog(LOG_ERR, "Error retrieving host address: %s", gai_strerror(rc));
+        syslog(LOG_ERR, "Unable to retrieve host address: %s", gai_strerror(rc));
         goto exit_start;
     }
 
@@ -137,19 +132,19 @@ static int open_listener() {
         int yes = 1;
 
         if ((fd = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol)) == -1) {
-            syslog(LOG_WARNING, "Could not create socket: %s", strerror(errno));
+            syslog(LOG_WARNING, "Unable to create socket: %s", strerror(errno));
             continue;
         }
 
         if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1) {
-            syslog(LOG_ERR, "Failed setting socket options: %s", strerror(errno));
+            syslog(LOG_ERR, "Unable to set socket options: %s", strerror(errno));
             close(fd);
             fd = -1;
             continue;
         }
 
         if (bind(fd, entry->ai_addr, entry->ai_addrlen) == -1) {
-            syslog(LOG_ERR, "Failed to bind socket: %s", strerror(errno));
+            syslog(LOG_ERR, "Unable to bind socket: %s", strerror(errno));
             close(fd);
             fd = -1;
             continue;
@@ -172,7 +167,7 @@ static void close_listener() {
     sigaddset(&new_mask, SIGINT);
     sigaddset(&new_mask, SIGTERM);
     if (sigprocmask(SIG_BLOCK, &new_mask, &old_mask) == -1) {
-        syslog(LOG_ERR, "Signal block failed: %s", strerror(errno));
+        syslog(LOG_ERR, "Unable to block SIGINT & SIGTERM: %s", strerror(errno));
     }
 
     if (listener_fd != -1) {
@@ -181,7 +176,7 @@ static void close_listener() {
     }
 
     if (sigprocmask(SIG_SETMASK, &old_mask, NULL) == -1) {
-        syslog(LOG_ERR, "Signal restoration failed: %s", strerror(errno));
+        syslog(LOG_ERR, "Unable to unblock SIGINT & SIGTERM: %s", strerror(errno));
     }
 }
 
@@ -191,13 +186,13 @@ static void reap_children(int options) {
 
     while ((pid = waitpid(-1, &status, options)) > 0) {
         if (WIFEXITED(status)) {
-            syslog(LOG_INFO, "Child process %d exited with status %d", pid, WEXITSTATUS(status));
+            syslog(LOG_INFO, "Client process %d exited with status %d", pid, WEXITSTATUS(status));
         } else if (WIFSIGNALED(status)) {
-            syslog(LOG_INFO, "Child process %d was terminated by signal %d", pid, WTERMSIG(status));
+            syslog(LOG_INFO, "Client process %d was terminated by signal %d", pid, WTERMSIG(status));
         } else if (WIFSTOPPED(status)) {
-            syslog(LOG_INFO, "Child process %d was stopped by signal %d", pid, WSTOPSIG(status));
+            syslog(LOG_INFO, "Client process %d was stopped by signal %d", pid, WSTOPSIG(status));
         } else {
-            syslog(LOG_WARNING, "Child process %d did not exit successfully", pid);
+            syslog(LOG_WARNING, "Client process %d did not exit successfully", pid);
         }
     }
 }
@@ -209,13 +204,13 @@ static void await_child_processes() {
     sigemptyset(&new_mask);
     sigaddset(&new_mask, SIGCHLD);
     if (sigprocmask(SIG_BLOCK, &new_mask, &old_mask) == -1) {
-        syslog(LOG_ERR, "Signal block failed: %s", strerror(errno));
+        syslog(LOG_ERR, "Unable to block SIGCHLD: %s", strerror(errno));
     }
 
     reap_children(0);
 
     if (sigprocmask(SIG_SETMASK, &old_mask, NULL) == -1) {
-        syslog(LOG_ERR, "Signal restoration failed: %s", strerror(errno));
+        syslog(LOG_ERR, "Unable to unblock SIGCHLD: %s", strerror(errno));
     }
 }
 
@@ -226,23 +221,24 @@ static void connection_handler(const int fd_client, const char *client_host) {
     size_t capacity = INET_BLOCK_SIZE;
     char *buf = malloc(capacity);
     if (!buf) {
-        syslog(LOG_ERR, "Failed buffer allocation: %s", strerror(errno));
+        syslog(LOG_ERR, "Unable to allocate client buffer: %s", strerror(errno));
         goto exit_start;
     }
 
     size_t pkt_len = 0;
     for (;;) {
-        ssize_t recv_len = recv(fd_client, buf + pkt_len, capacity - pkt_len, 0);
+        const ssize_t recv_len = recv(fd_client, buf + pkt_len, capacity - pkt_len, 0);
         if (recv_len == -1) {
             if (errno == EINTR) continue;
-            syslog(LOG_ERR, "Error while receiving data: %s", strerror(errno));
+            syslog(LOG_ERR, "Unable to receive client data: %s", strerror(errno));
             goto exit_buffer;
         }
         if (recv_len == 0) {
-            syslog(LOG_ERR, "Client closed without newline");
+            syslog(LOG_WARNING, "Client closed without newline");
             goto exit_buffer;
         }
 
+        // A packet is completed by a single newline. Anything after that is discarded.
         const char *newline = memchr(buf + pkt_len, '\n', recv_len);
         if (newline) {
             // Add 1 to include newline in packet
@@ -258,7 +254,7 @@ static void connection_handler(const int fd_client, const char *client_host) {
         capacity += INET_BLOCK_SIZE;
         char *tmp = realloc(buf, capacity);
         if (!tmp) {
-            syslog(LOG_ERR, "Failed buffer expansion: %s", strerror(errno));
+            syslog(LOG_ERR, "Unable to expand client buffer: %s", strerror(errno));
             goto exit_buffer;
         }
         buf = tmp;
@@ -270,6 +266,9 @@ static void connection_handler(const int fd_client, const char *client_host) {
         goto exit_buffer;
     }
 
+    // Lock the file all the way writing to the data file until we've sent the contents
+    // back to the client. Probably unnecessary for this assignment, and ultimately
+    // not scalable, especially if the client is slow to receive.
     if (flock(fd_data, LOCK_EX) == -1) {
         syslog(LOG_ERR, "Unable to lock data file: %d - %s", errno, strerror(errno));
         goto exit_file;
@@ -315,7 +314,9 @@ static void connection_handler(const int fd_client, const char *client_host) {
     exit_code = EXIT_SUCCESS;
 
 exit_lock:
-    flock(fd_data, LOCK_UN);
+    if (flock(fd_data, LOCK_UN) == -1) {
+        syslog(LOG_ERR, "Unable to unlock data file: %d - %s", errno, strerror(errno));
+    }
 
 exit_file:
     close(fd_data);
@@ -335,24 +336,22 @@ static void run_server() {
 
     syslog(LOG_INFO, "Waiting for connections");
     while (!g_shutdown) {
+        reap_children(WNOHANG);
         client_len = sizeof(client_addr);
         const int client_fd = accept(listener_fd, (struct sockaddr *) &client_addr, &client_len);
         if (client_fd == -1) {
-            if (errno == EINTR) {
-                reap_children(WNOHANG);
-                continue;
-            }
+            if (errno == EINTR) continue;
             if (errno == ECONNABORTED || errno == EPROTO || errno == ENETDOWN) {
                 syslog(LOG_WARNING, "Accept transient error: %s", strerror(errno));
                 continue;
             }
-            syslog(LOG_INFO, "Accept failed: %s", strerror(errno));
+            syslog(LOG_ERR, "Unable to accept connections: %s", strerror(errno));
             return;
         }
 
         pid_t pid = fork();
         if (pid == -1) {
-            syslog(LOG_ERR, "Fork failed: %s", strerror(errno));
+            syslog(LOG_ERR, "Unable to fork client process: %s", strerror(errno));
             close(client_fd);
             return;
         }
@@ -417,6 +416,7 @@ int main(int argc, char *argv[]) {
     }
 
     run_server();
+    // Make sure child processes have closed their file handles before removing data file.
     await_child_processes();
     if (g_shutdown) {
         syslog(LOG_INFO, "Caught signal, exiting");
@@ -437,7 +437,5 @@ exit_start:
         pipe_fd = -1;
     }
     closelog();
-
-    // Set to EXIT_SUCCESS by SIGTERM and SIGINT in handle_signals()
     return exit_code;
 }
