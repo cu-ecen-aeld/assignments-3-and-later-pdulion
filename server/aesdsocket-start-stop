@@ -17,18 +17,14 @@ DAEMON_ARGS="-d"
 STOP_SIGNAL="TERM"
 PIDFILE="/var/run/aesdsocket.pid"
 
-. /etc/init.d/functions
-
 do_start() {
     echo "Starting $NAME..."
     start-stop-daemon --start --quiet --make-pidfile --pidfile $PIDFILE --exec $DAEMON -- $DAEMON_ARGS
-    log_end_msg $?
 }
 
 do_stop() {
     echo "Stopping $NAME..."
     start-stop-daemon --stop --quiet --remove-pidfile --pidfile $PIDFILE --signal $STOP_SIGNAL --oknodo
-    log_end_msg $?
 }
 
 do_status() {
