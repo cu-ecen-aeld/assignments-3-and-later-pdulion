@@ -60,7 +60,7 @@ static int daemonize(const char *pid_file) {
         }
 
         // Wait for it to initialize
-        int daemon_started;
+        int daemon_started = 0;
         read(pipe_fds[PARENT_PIPE], &daemon_started, sizeof(daemon_started));
 
         // Daemon child has indicated startup or failure, so let's return to caller
