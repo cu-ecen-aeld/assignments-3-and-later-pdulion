@@ -18,15 +18,17 @@ DAEMON_ARGS="-d ${PIDFILE}"
 STOP_SIGNAL="TERM"
 
 do_start() {
-    echo "Starting $NAME..."
+    printf "Starting $NAME: "
     # pid file will be created by the daemon itself
     start-stop-daemon --start --quiet --exec $DAEMON -- $DAEMON_ARGS
+    [ $? = 0 ] && echo "OK" || echo "FAIL"
 }
 
 do_stop() {
-    echo "Stopping $NAME..."
+    printf "Stopping $NAME: "
     # pid file will be removed by the daemon itself
     start-stop-daemon --stop --quiet --pidfile $PIDFILE --signal $STOP_SIGNAL --oknodo
+    [ $? = 0 ] && echo "OK" || echo "FAIL"
 }
 
 do_status() {
