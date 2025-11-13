@@ -19,18 +19,20 @@ STOP_SIGNAL="TERM"
 
 do_start() {
     echo "Starting $NAME..."
+    # pid file will be created by the daemon itself
     start-stop-daemon --start --quiet --exec $DAEMON -- $DAEMON_ARGS
 }
 
 do_stop() {
     echo "Stopping $NAME..."
+    # pid file will be removed by the daemon itself
     start-stop-daemon --stop --quiet --pidfile $PIDFILE --signal $STOP_SIGNAL --oknodo
 }
 
 do_status() {
     if [ -f $PIDFILE ]; then
         PID=$(cat $PIDFILE)
-        if ps -p $PID > /dev/null 2>&1; then
+        if ps -o pid | grep $PID > /dev/null 2>&1; then
             echo "$NAME is running (pid $PID)"
             return 0
         else
