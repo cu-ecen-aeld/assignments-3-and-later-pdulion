@@ -17,8 +17,10 @@
 
 #define ACCEPT_BACKLOG 10
 
+static const uint16_t PORT = 9000;
 static const char *DATA_FILE = "/var/tmp/aesdsocketdata";
 static const size_t INET_BLOCK_SIZE = 1024;
+static const int ENABLE = 1;
 
 volatile sig_atomic_t g_shutdown = false;
 int listener_fd = -1;
@@ -116,47 +118,39 @@ static int init_signals() {
 }
 
 static int open_listener() {
-    int fd = -1;
-    int rc;
-    struct addrinfo hints = {0}, *info;
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(PORT);
+    int fd;
 
-    if ((rc = getaddrinfo(NULL, "9000", &hints, &info)) != 0) {
-        syslog(LOG_ERR, "Unable to retrieve host address: %s", gai_strerror(rc));
+    if ((fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+        syslog(LOG_WARNING, "Unable to create socket: %s", strerror(errno));
         goto exit_start;
     }
 
-    for (struct addrinfo *entry = info; entry != NULL; entry = entry->ai_next) {
-        int yes = 1;
-
-        if ((fd = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol)) == -1) {
-            syslog(LOG_WARNING, "Unable to create socket: %s", strerror(errno));
-            continue;
-        }
-
-        if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1) {
-            syslog(LOG_ERR, "Unable to set socket options: %s", strerror(errno));
-            close(fd);
-            fd = -1;
-            continue;
-        }
-
-        if (bind(fd, entry->ai_addr, entry->ai_addrlen) == -1) {
-            syslog(LOG_ERR, "Unable to bind socket: %s", strerror(errno));
-            close(fd);
-            fd = -1;
-            continue;
-        }
-
-        break;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &ENABLE, sizeof(ENABLE)) == -1) {
+        syslog(LOG_ERR, "Unable to set socket options: %s", strerror(errno));
+        goto exit_socket;
     }
 
-    freeaddrinfo(info);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+        syslog(LOG_ERR, "Unable to bind socket: %s", strerror(errno));
+        goto exit_socket;
+    }
+
+    if (listen(fd, ACCEPT_BACKLOG) == -1) {
+        syslog(LOG_ERR, "Unable to listen for connections: %s", strerror(errno));
+        goto exit_socket;
+    }
+
+    return fd;
+
+exit_socket:
+    close(fd);
 
 exit_start:
-    return fd;
+    return -1;
 }
 
 static void close_listener() {
@@ -330,7 +324,7 @@ exit_start:
     _exit(exit_code);
 }
 
-static void run_server() {
+static void run() {
     struct sockaddr_storage client_addr;
     socklen_t client_len;
 
@@ -381,7 +375,6 @@ static void run_server() {
 }
 
 int main(int argc, char *argv[]) {
-    int exit_code = EXIT_FAILURE;
     openlog("aesdsocket", LOG_PID, LOG_USER);
 
     int pipe_fd = -1;
@@ -394,18 +387,13 @@ int main(int argc, char *argv[]) {
 
     if (init_signals() == -1) {
         syslog(LOG_ERR, "Unable to configure signal handling: %s", strerror(errno));
-        goto exit_start;
+        goto exit_pipe;
     }
 
     listener_fd = open_listener();
     if (listener_fd == -1) {
         syslog(LOG_ERR, "Unable to bind to host port");
-        goto exit_start;
-    }
-
-    if (listen(listener_fd, ACCEPT_BACKLOG) == -1) {
-        syslog(LOG_ERR, "Unable to listen for connections: %s", strerror(errno));
-        goto exit_server_init;
+        goto exit_pipe;
     }
 
     if (pipe_fd != -1) {
@@ -415,27 +403,30 @@ int main(int argc, char *argv[]) {
         pipe_fd = -1;
     }
 
-    run_server();
+    run();
+
     // Make sure child processes have closed their file handles before removing data file.
     await_child_processes();
     if (g_shutdown) {
         syslog(LOG_INFO, "Caught signal, exiting");
-        exit_code = EXIT_SUCCESS;
         if (remove(DATA_FILE) == -1 && errno != ENOENT) {
             syslog(LOG_ERR, "Unable to remove %s: %s", DATA_FILE, strerror(errno));
         }
     }
 
-exit_server_init:
     close_listener();
+    closelog();
+    return EXIT_SUCCESS;
 
-exit_start:
+exit_pipe:
     if (pipe_fd != -1) {
         const int daemon_started = 0;
         write(pipe_fd, &daemon_started, sizeof(daemon_started));
         close(pipe_fd);
         pipe_fd = -1;
     }
+
+exit_start:
     closelog();
-    return exit_code;
+    return EXIT_FAILURE;
 }
