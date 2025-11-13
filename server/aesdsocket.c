@@ -46,7 +46,7 @@ static int daemonize(const char *pid_file) {
     if (pid > 0) {
         // Parent: Daemon child successfully created, capture pid
         if (pid_file) {
-            int pid_fd = pid_fd = creat(pid_file, 0644);
+            int pid_fd = creat(pid_file, 0644);
             if (pid_fd == -1) {
                 syslog(LOG_ERR, "Unable to create pid file %s: %s", pid_file, strerror(errno));
             } else {
@@ -428,7 +428,6 @@ int main(int argc, char *argv[]) {
     if (pipe_fd != -1) {
         write(pipe_fd, &STARTED, sizeof(STARTED));
         close(pipe_fd);
-        pipe_fd = -1;
     }
 
     run();
@@ -455,7 +454,6 @@ exit_pipe:
     if (pipe_fd != -1) {
         write(pipe_fd, &STOPPED, sizeof(STOPPED));
         close(pipe_fd);
-        pipe_fd = -1;
     }
 
 exit_start:
