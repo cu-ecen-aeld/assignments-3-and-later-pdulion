@@ -21,31 +21,51 @@ static const uint16_t PORT = 9000;
 static const char *DATA_FILE = "/var/tmp/aesdsocketdata";
 static const size_t INET_BLOCK_SIZE = 1024;
 static const int ENABLE = 1;
+static const int STARTED = 1;
+static const int STOPPED = 0;
+static const int PARENT_PIPE = 0;
+static const int CHILD_PIPE = 1;
 
 volatile sig_atomic_t g_shutdown = false;
 int listener_fd = -1;
 
-static int daemonize() {
+static int daemonize(const char *pid_file) {
     int pipe_fds[2];
+    pid_t pid;
+
     if (pipe(pipe_fds) == -1) {
         syslog(LOG_ERR, "Unable to create pipe for daemon child: %s", strerror(errno));
-        return -1;
+        goto exit_start;
     }
 
-    pid_t pid = fork();
-    if (pid == -1) {
+    if ((pid = fork()) == -1) {
         syslog(LOG_ERR, "Unable to create daemon process: %s", strerror(errno));
-        close(pipe_fds[0]);
-        goto fail;
+        goto exit_pipe;
     }
-    if (pid > 0) {
-        // Parent: Daemon child successfully created, now wait for it to initialize
-        int daemon_started;
-        read(pipe_fds[0], &daemon_started, sizeof(daemon_started));
 
-        // Daemon child has indicated initialization or failure, so let's return to caller
-        close(pipe_fds[1]);
-        close(pipe_fds[0]);
+    if (pid > 0) {
+        // Parent: Daemon child successfully created, capture pid
+        if (pid_file) {
+            int pid_fd = pid_fd = creat(pid_file, 0644);
+            if (pid_fd == -1) {
+                syslog(LOG_ERR, "Unable to create pid file %s: %s", pid_file, strerror(errno));
+            } else {
+                char buffer[32];
+                const int len = snprintf(buffer, sizeof(buffer), "%d\n", pid);
+                if (write(pid_fd, buffer, len) == -1) {
+                    syslog(LOG_ERR, "Unable to write pid to file %s: %s", pid_file, strerror(errno));
+                }
+                close(pid_fd);
+            }
+        }
+
+        // Wait for it to initialize
+        int daemon_started;
+        read(pipe_fds[PARENT_PIPE], &daemon_started, sizeof(daemon_started));
+
+        // Daemon child has indicated startup or failure, so let's return to caller
+        close(pipe_fds[PARENT_PIPE]);
+        close(pipe_fds[CHILD_PIPE]);
         closelog();
         _exit(daemon_started ? EXIT_SUCCESS : EXIT_FAILURE);
     }
@@ -53,16 +73,15 @@ static int daemonize() {
     // Child: Configure for Daemon mode!
     if (setsid() == -1) {
         syslog(LOG_ERR, "Unable to create new session and process group: %s", strerror(errno));
-        goto fail;
+        goto exit_pipe;
     }
 
     umask(0);
     if (chdir("/") == -1) {
         syslog(LOG_ERR, "Unable to change to root directory: %s", strerror(errno));
-        goto fail;
+        goto exit_pipe;
     }
 
-    close(pipe_fds[0]);
     close(STDIN_FILENO);
     close(STDOUT_FILENO);
     close(STDERR_FILENO);
@@ -70,17 +89,21 @@ static int daemonize() {
     const int fd = open("/dev/null", O_RDWR);
     if (fd == -1) {
         syslog(LOG_ERR, "Unable to open /dev/null: %s", strerror(errno));
-        goto fail;
+        goto exit_pipe;
     }
     dup2(fd, STDIN_FILENO);
     dup2(fd, STDOUT_FILENO);
     dup2(fd, STDERR_FILENO);
     if (fd > STDERR_FILENO) close(fd);
 
-    return pipe_fds[1];
+    close(pipe_fds[PARENT_PIPE]);
+    return pipe_fds[CHILD_PIPE];
 
-fail:
-    close(pipe_fds[1]);
+exit_pipe:
+    close(pipe_fds[PARENT_PIPE]);
+    close(pipe_fds[CHILD_PIPE]);
+
+exit_start:
     return -1;
 }
 
@@ -375,11 +398,17 @@ static void run() {
 }
 
 int main(int argc, char *argv[]) {
+    char *pid_file = NULL;
+    int pipe_fd = -1;
+
     openlog("aesdsocket", LOG_PID, LOG_USER);
 
-    int pipe_fd = -1;
-    if (argc == 2 && strcmp(argv[1], "-d") == 0) {
-        pipe_fd = daemonize();
+    if (argc >= 2 && strcmp(argv[1], "-d") == 0) {
+        if (argc == 3) {
+            pid_file = argv[2];
+        }
+
+        pipe_fd = daemonize(pid_file);
         if (pipe_fd == -1) {
             goto exit_start;
         }
@@ -397,8 +426,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (pipe_fd != -1) {
-        const int daemon_started = 1;
-        write(pipe_fd, &daemon_started, sizeof(daemon_started));
+        write(pipe_fd, &STARTED, sizeof(STARTED));
         close(pipe_fd);
         pipe_fd = -1;
     }
@@ -412,6 +440,11 @@ int main(int argc, char *argv[]) {
         if (remove(DATA_FILE) == -1 && errno != ENOENT) {
             syslog(LOG_ERR, "Unable to remove %s: %s", DATA_FILE, strerror(errno));
         }
+        if (pid_file) {
+            if (remove(pid_file) == -1 && errno != ENOENT) {
+                syslog(LOG_ERR, "Unable to remove %s: %s", pid_file, strerror(errno));
+            }
+        }
     }
 
     close_listener();
@@ -420,8 +453,7 @@ int main(int argc, char *argv[]) {
 
 exit_pipe:
     if (pipe_fd != -1) {
-        const int daemon_started = 0;
-        write(pipe_fd, &daemon_started, sizeof(daemon_started));
+        write(pipe_fd, &STOPPED, sizeof(STOPPED));
         close(pipe_fd);
         pipe_fd = -1;
     }
